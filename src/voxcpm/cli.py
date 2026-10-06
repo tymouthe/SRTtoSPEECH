@@ -277,6 +277,172 @@ def cmd_clone(args, parser):
     return _run_single(args, parser, text=final_text, output=args.output, prompt_text=prompt_text)
 
 
+def cmd_srt(args, parser):
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from voxcpm.dubbing import DubOptions, SpeakerProfile
+    from voxcpm.script_voice import (
+        AGES,
+        ScriptVoicer,
+        find_srt_problems,
+        format_tagged_srt,
+        load_script,
+        voice_description,
+    )
+
+    srt = str(require_file_exists(args.srt, parser, "subtitle file"))
+    lines, profiles = load_script(srt, guess_missing_emotion=not args.no_guess_emotion)
+    for message in find_srt_problems(srt):
+        print(f"Warning: {message}", file=sys.stderr)
+    if not lines:
+        parser.error("No subtitle lines found in the SRT.")
+    if args.voices:
+        overrides = json.loads(require_file_exists(args.voices, parser, "voices file").read_text(encoding="utf-8"))
+        for name, cfg in overrides.items():
+            profile = profiles.setdefault(name, SpeakerProfile(name=name, voice_mode="clone_first"))
+            profile.gender = cfg.get("gender", profile.gender)
+            profile.age = cfg.get("age", profile.age)
+            if profile.age not in AGES:
+                parser.error(f"Age of {name!r} must be one of {AGES}")
+            profile.description = cfg.get("description", cfg.get("voice")) or voice_description(profile.gender, profile.age)
+            profile.reference_wav = cfg.get("reference", profile.reference_wav)
+    for line in lines:
+        line.gender = profiles[line.speaker].gender
+    output = validate_output_path(args.output)
+    print(f"{len(lines)} lines, speakers:", file=sys.stderr)
+    for p in profiles.values():
+        print(f"  {p.name}: {p.gender}, {p.age} — {p.description}", file=sys.stderr)
+    if args.tag_only:
+        tagged = output.with_name(output.stem + "_tagged.srt")
+        tagged.write_text(format_tagged_srt(lines, profiles), encoding="utf-8")
+        print(f"Tagged SRT: {tagged}", file=sys.stderr)
+        return
+
+    only = None
+    if args.regenerate:
+        if not args.workdir:
+            parser.error("--regenerate needs the --workdir of the earlier run")
+        try:
+            only = {int(i) for i in args.regenerate.replace(" ", "").split(",") if i}
+        except ValueError:
+            parser.error("--regenerate takes line numbers, e.g. --regenerate 5,31")
+
+    model = load_model(args)
+    workdir = args.workdir or tempfile.mkdtemp(prefix="voxcpm_srt_")
+    voicer = ScriptVoicer(model, workdir)
+    options = DubOptions(
+        cfg_value=args.cfg_value,
+        inference_timesteps=args.inference_timesteps,
+        normalize=args.normalize,
+        seed=args.seed,
+        verify_voice=not args.no_voice_check,
+        max_attempts=args.max_attempts,
+        first_line_attempts=max(args.max_attempts, 12),
+        max_speedup=args.max_speedup,
+        pad_to_slot=args.pad,
+        remove_silence=not args.keep_silence,
+        max_pause=args.max_pause,
+        pitch_tolerance=2.0,
+        min_consistency=0.6,
+    )
+
+    def _progress(i, n, line):
+        if i < n:
+            print(f"[{i + 1}/{n}] {line.speaker} ({line.emotion}): {line.text[:60]}", file=sys.stderr)
+
+    result = voicer.voice(lines, profiles, str(output), options, progress=_progress, only=only)
+    for message in result.warnings:
+        print(f"Warning: {message}", file=sys.stderr)
+    failed = [r["index"] for r in result.report if not r.get("voice_ok", True) or not r.get("gender_ok", True)]
+    if failed:
+        print(
+            f"To retry the failed lines: voxcpm srt --srt {args.srt} -o {args.output} --workdir {workdir} "
+            f"--regenerate {','.join(map(str, failed))}",
+            file=sys.stderr,
+        )
+    print(f"Combined track: {result.audio_path}", file=sys.stderr)
+    print(f"Every line: {result.lines_dir}{os.sep}", file=sys.stderr)
+    print(f"Tagged SRT: {result.tagged_srt_path}", file=sys.stderr)
+    print(str(Path(result.audio_path)))
+
+
+def cmd_dub(args, parser):
+    import json
+    import tempfile
+
+    from voxcpm.dubbing import DubOptions, VideoDubber, apply_speaker_overrides, profiles_to_json
+
+    video = str(require_file_exists(args.video, parser, "video file"))
+    srt = str(require_file_exists(args.srt, parser, "subtitle file")) if args.srt else None
+    overrides = {}
+    if args.speakers:
+        overrides = json.loads(require_file_exists(args.speakers, parser, "speakers file").read_text(encoding="utf-8"))
+    validate_output_path(args.output)
+
+    model = load_model(args)
+    workdir = args.workdir or tempfile.mkdtemp(prefix="voxcpm_dub_")
+    try:
+        dubber = VideoDubber(model, workdir)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    background = args.background
+
+    print("Analysing video and subtitles (vocal removal, gender, emotion)...", file=sys.stderr)
+    lines, profiles = dubber.prepare(
+        video,
+        srt,
+        transcribe_model=args.transcribe_model,
+        language=args.language,
+        remove_vocals=args.remove_vocals or background == "instrumental",
+        detect_emotion=not args.no_emotion,
+        separation_device=None if args.device == "auto" else args.device,
+        identify_speakers=not args.no_speaker_id,
+        num_speakers=args.num_speakers,
+        two_voices=args.two_voices,
+        speaker_style=not args.no_speaker_style,
+    )
+    if args.voice_mode:
+        for profile in profiles.values():
+            profile.voice_mode = args.voice_mode
+    apply_speaker_overrides(profiles, overrides)
+    print(f"{len(lines)} lines, speakers:\n{profiles_to_json(profiles)}", file=sys.stderr)
+
+    options = DubOptions(
+        background=background,
+        duck_db=args.duck_db,
+        max_speedup=args.max_speedup,
+        cfg_value=args.cfg_value,
+        inference_timesteps=args.inference_timesteps,
+        denoise_reference=not args.no_denoise_reference,
+        clean_generated=not args.no_clean,
+        normalize=args.normalize,
+        seed=args.seed,
+        embed_subtitles=not args.no_embed_subtitles,
+        use_tone_control=not args.no_tone_control,
+        verify_voice=not args.no_voice_check,
+        max_attempts=args.max_attempts,
+        first_line_attempts=max(args.max_attempts, 12),
+    )
+
+    def _progress(i, n, line):
+        if i < n:
+            print(f"[{i + 1}/{n}] {line.speaker}: {line.text[:60]}", file=sys.stderr)
+
+    result = dubber.run(video, lines, profiles, args.output, options, progress=_progress)
+    for message in dubber.warnings:
+        print(f"Warning: {message}", file=sys.stderr)
+    print(f"Dubbed audio: {result.audio_path}", file=sys.stderr)
+    print(f"Subtitles: {result.srt_path} (with speakers: {result.speaker_srt_path})", file=sys.stderr)
+    if result.instrumental_path:
+        print(f"Instrumental (vocals removed): {result.instrumental_path}", file=sys.stderr)
+    if result.video_path:
+        print(f"Dubbed video: {result.video_path}", file=sys.stderr)
+    print(f"Working files: {workdir}", file=sys.stderr)
+
+
 def cmd_validate(args, parser):
     from voxcpm.training.validate import (
         print_validation_report,
@@ -552,6 +718,7 @@ Examples:
   voxcpm design --text "Hello world" --control "warm female voice" --output out.wav
   voxcpm clone --text "Hello" --reference-audio ref.wav --output out.wav
   voxcpm batch --input texts.txt --output-dir ./outs --reference-audio ref.wav
+  voxcpm dub --video movie.mp4 --srt movie.srt --output movie_dub.mp4
         """,
     )
 
@@ -604,6 +771,165 @@ Examples:
     _add_model_args(batch_parser)
     _add_lora_args(batch_parser)
     _add_timestamp_args(batch_parser, include_output=False)
+
+    # Dub subcommand
+    dub_parser = subparsers.add_parser(
+        "dub",
+        help="Re-voice a multi-speaker video line by line from its SRT subtitles",
+    )
+    dub_parser.add_argument("--video", "-v", required=True, help="Input video (or audio) file")
+    dub_parser.add_argument(
+        "--srt",
+        help="Subtitle file. Tag speakers as '[Alice] text' or 'Alice: text'. "
+        "If omitted, the video is auto-transcribed (needs voxcpm[timestamps])",
+    )
+    dub_parser.add_argument("--output", "-o", required=True, help="Output video path (.mp4 or .mkv)")
+    dub_parser.add_argument(
+        "--speakers",
+        help='JSON file with per-speaker overrides, e.g. {"Alice": {"gender": "female", '
+        '"voice_mode": "design", "description": "young woman, bright voice"}}',
+    )
+    dub_parser.add_argument(
+        "--two-voices",
+        action="store_true",
+        help="Voice the whole video with only two voices, one adult male and one adult female, instead of "
+        "the default one consistent voice per detected speaker (emotion is still applied per line)",
+    )
+    dub_parser.add_argument(
+        "--no-speaker-style",
+        action="store_true",
+        help="With the two voices, do not style each line after how its original character speaks "
+        "(pitch register, delivery, pace, loudness)",
+    )
+    dub_parser.add_argument(
+        "--voice-mode",
+        choices=["clone_first", "clone_line", "clone_speaker", "design"],
+        help="Voice source for all speakers: copy each speaker's first line from the original and clone "
+        "that generated line for all their other lines (clone_first, the default for characters), clone "
+        "each line from its original audio, clone one voice per speaker from all their lines, or design a "
+        "voice from gender/description (default: auto)",
+    )
+    dub_parser.add_argument(
+        "--background",
+        choices=["mute", "instrumental", "duck", "keep"],
+        default="mute",
+        help="Background: nothing, only the generated voices (mute); original with its vocals removed "
+        "(instrumental); original lowered under dubbed lines (duck); untouched original (keep) (default: mute)",
+    )
+    dub_parser.add_argument(
+        "--remove-vocals",
+        action="store_true",
+        help="Separate the original vocals with Hybrid Demucs and clone/analyse from them (needs extra weights)",
+    )
+    dub_parser.add_argument("--no-emotion", action="store_true", help="Skip SenseVoice emotion detection")
+    dub_parser.add_argument(
+        "--num-speakers", type=int, default=None, help="Number of characters for untagged lines (default: auto)"
+    )
+    dub_parser.add_argument(
+        "--no-speaker-id",
+        action="store_true",
+        help="Do not detect characters by voice (untagged lines are then grouped by pitch)",
+    )
+    dub_parser.add_argument(
+        "--no-voice-check",
+        action="store_true",
+        help="Do not verify that each generated line matches its character's voice",
+    )
+    dub_parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=8,
+        help="Tries per line until it is consistent with its speaker (default: 8; a speaker's first line gets "
+        "at least 12, since all their other lines copy it)",
+    )
+    dub_parser.add_argument(
+        "--no-clean", action="store_true", help="Do not denoise / loudness-level the generated voices"
+    )
+    dub_parser.add_argument("--duck-db", type=float, default=-18.0, help="Ducking gain in dB (default: -18)")
+    dub_parser.add_argument(
+        "--max-speedup",
+        type=float,
+        default=1.35,
+        help="Max time-stretch factor to fit a line into its subtitle slot (default: 1.35)",
+    )
+    dub_parser.add_argument("--no-embed-subtitles", action="store_true", help="Do not embed the SRT in the video")
+    dub_parser.add_argument("--no-tone-control", action="store_true", help="Do not pass detected tone as style hint")
+    dub_parser.add_argument("--transcribe-model", default="base", help="Whisper model for auto-transcription")
+    dub_parser.add_argument("--language", help="Language code for auto-transcription (e.g. en, zh)")
+    dub_parser.add_argument("--workdir", help="Directory for intermediate files (default: temp dir)")
+    dub_parser.add_argument("--cfg-value", type=float, default=2.0, help="CFG guidance scale (default: 2.0)")
+    dub_parser.add_argument("--inference-timesteps", type=int, default=10, help="Inference steps (default: 10)")
+    dub_parser.add_argument("--normalize", action="store_true", help="Enable text normalization")
+    dub_parser.add_argument(
+        "--no-denoise-reference", action="store_true", help="Do not ZipEnhancer-denoise reference clips"
+    )
+    dub_parser.add_argument(
+        "--seed", type=int, default=None, help="Base random seed (each character gets its own fixed seed from it)"
+    )
+    _add_model_args(dub_parser)
+    _add_lora_args(dub_parser)
+
+    # SRT subcommand
+    srt_parser = subparsers.add_parser(
+        "srt",
+        help="Voice a whole tagged SRT script (no video): one consistent voice per speaker",
+    )
+    srt_parser.add_argument(
+        "--srt",
+        required=True,
+        help="Subtitles with lines tagged '[Name|male|kid|sad] text' (gender, age and emotion optional; "
+        "gender/age once per speaker; untagged lines are read by Narrator)",
+    )
+    srt_parser.add_argument(
+        "--output", "-o", required=True,
+        help="Combined track (.wav). Every line is also saved to <output>_lines/ and the tagged SRT to <output>_tagged.srt",
+    )
+    srt_parser.add_argument(
+        "--voices",
+        help='JSON file with per-speaker overrides, e.g. {"Dara": {"gender": "male", "age": "kid", '
+        '"description": "cheeky little boy", "reference": "dara.wav"}}',
+    )
+    srt_parser.add_argument(
+        "--keep-silence", action="store_true",
+        help="Keep the silence before/after each line and its long pauses (default: removed when a line is finalized)",
+    )
+    srt_parser.add_argument(
+        "--max-pause", type=float, default=0.2,
+        help="Longest pause kept inside a line, in seconds; longer pauses are shortened to it (default: 0.2)",
+    )
+    srt_parser.add_argument(
+        "--pad", action="store_true",
+        help="Pad line files that are shorter than their subtitle slot with trailing silence (default: natural length)",
+    )
+    srt_parser.add_argument("--no-guess-emotion", action="store_true", help="Do not guess missing emotions (use neutral)")
+    srt_parser.add_argument(
+        "--tag-only", action="store_true", help="Only write the fully tagged SRT (to check/edit it), do not generate"
+    )
+    srt_parser.add_argument(
+        "--no-voice-check", action="store_true", help="Do not check that each line matches its speaker's first line"
+    )
+    srt_parser.add_argument(
+        "--max-attempts", type=int, default=8,
+        help="Tries per line until consistent (default: 8; each speaker's first line gets at least 12)",
+    )
+    srt_parser.add_argument(
+        "--max-speedup", type=float, default=1.1,
+        help="Max speed-up to fit a line into its slot in the combined track (default: 1.1); longer lines push the "
+        "next lines later instead of being squeezed",
+    )
+    srt_parser.add_argument(
+        "--regenerate",
+        help="Only regenerate these line numbers (e.g. 5,31) of an earlier run; needs that run's --workdir",
+    )
+    srt_parser.add_argument("--workdir", help="Directory for intermediate files (default: temp dir)")
+    srt_parser.add_argument("--cfg-value", type=float, default=2.0, help="CFG guidance scale (default: 2.0)")
+    srt_parser.add_argument("--inference-timesteps", type=int, default=10, help="Inference steps (default: 10)")
+    srt_parser.add_argument("--normalize", action="store_true", help="Enable text normalization")
+    srt_parser.add_argument(
+        "--seed", type=int, default=None, help="Base random seed (each speaker gets its own fixed seed from it)"
+    )
+    _add_model_args(srt_parser)
+    _add_lora_args(srt_parser)
 
     # Validate subcommand
     validate_parser = subparsers.add_parser(
@@ -684,6 +1010,12 @@ def main():
 
     if args.command == "batch":
         return cmd_batch(args, parser)
+
+    if args.command == "dub":
+        return cmd_dub(args, parser)
+
+    if args.command == "srt":
+        return cmd_srt(args, parser)
 
     return _dispatch_legacy(args, parser)
 

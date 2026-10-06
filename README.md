@@ -260,6 +260,121 @@ voxcpm design \
 voxcpm --help
 ```
 
+### Video Dubbing (multi-speaker)
+
+Re-voice a conversation video line by line from its SRT subtitles. The original audio is muted, so the final
+video contains only the generated voices:
+
+- **Characters** — tag speakers in the SRT as `[Alice] Hello` or `Alice: Hello`. Untagged lines are grouped by *voice*
+  (CAM++ speaker embeddings) into *Speaker 1*, *Speaker 2*, … (`--num-speakers` fixes the count), and tagged lines whose
+  voice does not match their character are kept out of that character's reference.
+- **Retried until consistent** — every generated line is checked (CAM++) against its speaker's voice and regenerated
+  with a new seed until it is consistent: close enough to the speaker's generated first line *and* to the average of
+  their lines accepted so far (`min_consistency`, 0.55), more like them than like anyone else, and at the speaker's
+  pitch. Up to `--max-attempts` tries (default 8; a speaker's first line, which all their other lines copy, gets at
+  least 12). Lines that still fail are marked ⚠ in the report and listed in a warning.
+- **Accurate, consistent tone** — gender (pitch), emotion (SenseVoice: happy, sad, angry, …) and prosody are detected per line.
+  Prosody is described relative to each character's *own* baseline, every character keeps one reference voice and one fixed
+  seed, and a designed voice is reused as the reference for that character's later lines.
+- **Clean output** — reference clips are denoised once (ZipEnhancer); every generated line is high-passed, spectrally
+  gated and loudness-levelled, breaths/mumbles after the last word are cut, edges are faded, and the line is fitted into
+  its time slot (silence trimmed, sped up with ffmpeg `atempo` by at most `--max-speedup`, or regenerated at a faster
+  pace; trimmed only if it would overlap the next line).
+- **One consistent voice per speaker (default)** — every speaker (*Speaker 1*, *Speaker 2*, … or your tags) gets a
+  fixed voice prompt scanned from their own original lines (gender, pitch register, delivery, pace and loudness
+  compared with the rest of the cast, usual mood; e.g. `Adult female voice, high, bright pitch, steady, calm delivery`).
+  Their first line (long enough, at an adult pitch) is copied from the original video (`clone_first`), and every later
+  line of that speaker clones that *generated* first line with the same prompt and seed, so line 2, 3, … sound like
+  line 1. The report shows this as `clone→#<first line>`. Short lines (slot ≤ 1.6 s, e.g. a one-word reply) get only
+  their emotion as a style hint — with the full voice prompt VoxCPM tends to babble on for seconds after one word — and
+  every line's generation is capped at about twice its slot; a try that runs on or is nearly silent is retried. Short
+  clips are voice-checked too (looped to a checkable length) and clips under 1 s are never pitch-shifted. Only the emotion and that line's difference from the
+  speaker's usual delivery change per line; pitch follows the original line relative to the speaker's own usual pitch
+  (within -2/+3 semitones) and is corrected by at most 2 semitones. Edit the prompts in the Characters table or in
+  `--speakers`; `{"Speaker 1": {"reference": "my_voice.wav"}}` uses your own recording for every line instead.
+- **Two voices only (`--two-voices`)** — voice the whole video with one adult male and one adult female voice. Each
+  speaker goes to the voice of their gender; each voice copies the first adult line of that gender (`clone_first`; set
+  `"voice_mode": "design"` to design it from a description instead), and each line is *styled* after its original
+  speaker — pitch register, delivery, pace and loudness (e.g. `deep pitch, fast-paced, soft-spoken`) — so speakers
+  sharing a voice still speak differently (`--no-speaker-style` turns this off). With `design`, the designed voice is
+  first checked against the original speakers (pitch, and CAM++ voice match) and re-designed with new seeds (up to 5
+  tries) until it fits; the closest reading is kept and pitch-corrected, with a warning naming the clip, when none fits.
+- Voice modes: `clone_first`, `clone_speaker` (one cloned voice per character), `clone_line` (clone each line from its own original audio),
+  `design` (voice from a description such as `young woman, bright and cheerful`).
+- Without `--srt`, the video is auto-transcribed (`pip install "voxcpm[timestamps]"`). Requires `ffmpeg` on PATH.
+- **VoxCPM2 only** — dubbing refuses to run with VoxCPM 1.x models (it needs VoxCPM2's reference cloning with style
+  control, 48 kHz output and 30-language support).
+
+```bash
+voxcpm dub --video scene.mp4 --srt scene.srt --output scene_dub.mp4
+
+# Per-character overrides
+cat > speakers.json <<'JSON'
+{"Alice": {"gender": "female", "voice_mode": "design", "description": "young woman, bright and cheerful"},
+ "Bob":   {"voice_mode": "clone_speaker"}}
+JSON
+voxcpm dub --video scene.mp4 --srt scene.srt --speakers speakers.json --output scene_dub.mp4
+```
+
+Outputs: `scene_dub.mp4` (with soft subtitles), `scene_dub_dub.wav`, `scene_dub.srt` and `scene_dub_speakers.srt`.
+Optional: `--background instrumental` keeps the original music & effects by removing its vocals with Hybrid Demucs
+(weights downloaded once from `download.pytorch.org`); `--background duck|keep` keeps the original audio.
+`--no-emotion` / `--no-clean` turn those steps off. Video dubbing is CLI-only; the web demo has the script-only
+**📝 SRT → Speech** tab below.
+
+### SRT → Speech (script only, no video)
+
+Voice a whole subtitle script in bulk when there is no video, or when the original audio is too poor to clone from.
+Tag each line with its speaker and, optionally, gender, age and emotion (any order; gender and age once per speaker):
+
+```text
+1
+00:00:00,200 --> 00:00:02,800
+[Dara|male|kid|sad] ម៉ាក់ កូននឹកម៉ាក់ណាស់
+
+2
+00:00:03,800 --> 00:00:05,400
+[Srey|female|adult] រៀបការអស់រយៈពេល ៧ ឆ្នាំ
+
+3
+00:00:05,600 --> 00:00:07,000
+[Dara] ម៉ាក់?
+```
+
+- Gender `male`/`female` (or `boy`/`girl`, which also mean kid), age `adult`/`kid`, emotion `happy`, `sad`, `angry`,
+  `fearful`, `surprised`, … or any word. Untagged lines are read by *Narrator*. Missing emotions are guessed from
+  punctuation (`?!`, `!`, `…`) and English keywords (`--no-guess-emotion` turns this off).
+- Each speaker's voice is made once as a **calm, neutral reading of their first line** (joined with their next lines
+  until it is ~4 s long), retried until its pitch is in the range for their gender and age (e.g. 200–380 Hz for a boy).
+  **Every line of that speaker — the first one too — clones that voice**, adds its own emotion as a style hint and is
+  retried until it is consistent with it (CAM++ voice check, up to `--max-attempts`). Being neutral, the voice does not
+  carry one line's emotion (say, a happy first line) into all the others.
+- **Clear male / female** — a man's voice is made between 90 and 140 Hz and a woman's between 185 and 255 Hz (well
+  away from the ~165 Hz point where they meet), and every line must stay on its side (a man's under 160 Hz, a woman's
+  over 175 Hz, a kid's over 200 Hz) or it is redone; lines that still are not are listed in a warning. Each line also
+  stays within 2 semitones of its speaker's voice and at least 0.6 close to it (CAM++).
+- **Silences removed** — when a line is finalized the silence before and after the speech is cut and every pause
+  inside it longer than `--max-pause` (0.2 s) is shortened to it, so words never run together but no dead air is left
+  (`--keep-silence` turns this off).
+- In the combined track lines keep their natural pace (sped up by at most `--max-speedup`, 1.1); a line that is still
+  longer than its slot pushes the following lines a little later instead of being squeezed.
+- Outputs: `<output>.wav` (all lines on the SRT timing), `<output>_lines/` (every line as its own file, at its natural
+  length; `--pad` pads a line shorter than its subtitle slot with trailing silence to the slot's length),
+  `<output>_tagged.srt` (every line tagged with speaker, gender, age and emotion — edit it and run again).
+
+```bash
+voxcpm srt --srt script.srt --output script.wav            # bulk generate
+voxcpm srt --srt script.srt --output script.wav --tag-only # only write script_tagged.srt to check emotions
+voxcpm srt --srt script.srt --output script.wav --voices voices.json
+# redo only failed lines of an earlier run (same voices, new seeds); the command is printed after a run
+voxcpm srt --srt script.srt --output script.wav --workdir work --regenerate 5,31
+# voices.json: {"Dara": {"gender": "male", "age": "kid", "description": "cheeky little boy", "reference": "dara.wav"}}
+```
+
+The web demo has the same workflow in the **📝 SRT → Speech** tab: listen to and download every line (or all of
+them as one `.zip`), **🔁 Regenerate** the lines that need a look (they are pre-selected), or give a speaker a
+**🎭 New voice** (their voice is designed again and all of their lines are regenerated).
+
 ### Web Demo
 
 ```bash

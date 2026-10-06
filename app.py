@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import tempfile
 import logging
 import random
 import numpy as np
@@ -120,6 +121,8 @@ _I18N_TRANSLATIONS = {
         "seed_info": "Seed used for reproducible generation. Updated with the actual successful seed after generation.",
         "random_seed_label": "Random Seed",
         "random_seed_info": "Generate a new seed before each inference run.",
+        "tab_tts": "🗣️ Text to Speech",
+        "tab_srt": "📝 SRT → Speech",
         "usage_instructions": _USAGE_INSTRUCTIONS_EN,
         "examples_footer": _EXAMPLES_FOOTER_EN,
     },
@@ -143,6 +146,8 @@ _I18N_TRANSLATIONS = {
         "cfg_info": "数值越高 → 越贴合提示/参考音色；数值越低 → 生成风格更自由",
         "dit_steps_label": "LocDiT 流匹配迭代步数",
         "dit_steps_info": "LocDiT 流匹配生成迭代步数 — 步数越多 → 可能生成更好的音频质量，但速度变慢",
+        "tab_tts": "🗣️ 语音合成",
+        "tab_srt": "📝 字幕配音",
         "usage_instructions": _USAGE_INSTRUCTIONS_ZH,
         "examples_footer": _EXAMPLES_FOOTER_ZH,
     },
@@ -211,6 +216,7 @@ _CUSTOM_CSS = """
 .switch-toggle input[type="checkbox"]:checked::after {
     transform: translateX(20px);
 }
+
 """
 
 _APP_THEME = gr.themes.Soft(
@@ -348,6 +354,379 @@ class VoxCPMDemo:
         return (current_model.tts_model.sample_rate, wav, last_successful_seed)
 
 
+# ---------- Shared helpers ----------
+
+
+def _notes(warnings: list, done: bool = False) -> str:
+    """Warnings kept on the page (pop-ups are easy to miss)."""
+    if not warnings:
+        return "✅ Done — every line is consistent with its speaker." if done else ""
+    return "**⚠️ Warnings**\n\n" + "\n".join(f"- {w}" for w in warnings)
+
+
+def _table_rows(value) -> list:
+    if value is None:
+        return []
+    if hasattr(value, "values") and hasattr(value, "columns"):  # pandas.DataFrame
+        value = value.values.tolist()
+    return [row for row in value if any(str(c).strip() for c in row)]
+
+
+# ---------- SRT → Speech tab ----------
+
+_SRT_INSTRUCTIONS = (
+    "**📝 Voice a whole SRT script — no video needed**\n\n"
+    "1. Upload an **SRT** whose lines are tagged `[Name|male|kid|sad] text`. After the name, gender (`male` / "
+    "`female`, or `boy` / `girl`), age (`adult` / `kid`) and emotion (`happy`, `sad`, `angry`, `fearful`, `surprised`, "
+    "… or any word) are optional and in any order; gender and age only need to be given once per speaker. "
+    "Untagged lines are read by *Narrator*.\n"
+    "2. Click **Analyze** — missing emotions are guessed from punctuation (and English keywords). Check and edit the "
+    "tables; download the fully tagged SRT to keep your edits.\n"
+    "3. Click **Generate** — each speaker's voice is made once as a **calm, neutral reading of their first line** "
+    "(retried until its pitch fits their gender and age, e.g. a kid's). **Every line of that speaker — the first one "
+    "too — clones that voice** and adds its own emotion, retried until it is consistent. You get one combined track "
+    "on the SRT timing plus every line as its own file.\n"
+    "4. A line still marked ⚠? It is pre-selected under **🔁 Lines to regenerate** — click **Regenerate selected "
+    "lines** to redo just those lines with new seeds (same speaker voice); the combined track is rebuilt.\n"
+    "5. A speaker's voice doesn't fit them? Choose them under **🎭 New voice for a speaker** (edit their gender, age or "
+    "description in the Speakers table first if you like) — their voice is designed again and all of their lines are "
+    "regenerated."
+)
+_SRT_SPEAKER_HEADERS = ["Speaker", "Gender", "Age", "Voice description", "Lines"]
+_SRT_LINE_HEADERS = ["#", "Start", "End", "Speaker", "Emotion", "Text"]
+_SRT_REPORT_HEADERS = [
+    "#", "Speaker", "Gender", "Age", "Emotion", "Mode", "Voice match", "Pitch (Hz)", "Status", "Tries", "Slot (s)",
+    "Generated (s)", "Text",
+]
+
+
+def _line_status(r: dict) -> str:
+    issues = list(r.get("issues") or [])
+    if not issues and not r.get("voice_ok", True):
+        issues.append("not consistent")
+    if not r.get("gender_ok", True) and "unclear gender" not in issues:
+        issues.append("unclear gender")
+    issues = [f"unclear gender ({r.get('pitch_hz')} Hz)" if i == "unclear gender" else i for i in issues]
+    status = "⚠ " + ", ".join(issues) if issues else "✅ OK"
+    if r.get("trimmed"):
+        status += " · repeats trimmed"
+    return status
+
+
+def build_srt_tab(demo: VoxCPMDemo):
+    import shutil
+
+    from voxcpm import dubbing, script_voice
+
+    speaker_models = {}
+
+    def _analyze(srt_path, guess_emotion):
+        if not srt_path:
+            raise gr.Error("Please upload an SRT file first.")
+        try:
+            lines, profiles = script_voice.load_script(srt_path, guess_missing_emotion=bool(guess_emotion))
+        except Exception as e:
+            raise gr.Error(f"Could not read the SRT: {e}")
+        if not lines:
+            raise gr.Error("No subtitle lines found.")
+        problems = script_voice.find_srt_problems(srt_path)
+        for message in problems:
+            gr.Warning(message, duration=None)
+        workdir = tempfile.mkdtemp(prefix="voxcpm_srt_")
+        tagged = os.path.join(workdir, Path(srt_path).stem + "_tagged.srt")
+        Path(tagged).write_text(script_voice.format_tagged_srt(lines, profiles), encoding="utf-8")
+        line_rows = [
+            [
+                l.index, round(l.start, 3), round(l.end, 3), l.speaker,
+                l.emotion + (" (guessed)" if l.features.get("emotion_guessed") else ""), l.text,
+            ]
+            for l in lines
+        ]
+        return script_voice.speaker_summary(lines, profiles), line_rows, tagged, workdir, _notes(problems)
+
+    def _read_tables(speaker_rows, line_rows):
+        profiles = {}
+        for row in _table_rows(speaker_rows):
+            name, gender, age, description = (list(row) + [""] * 4)[:4]
+            name = str(name).strip()
+            if not name:
+                continue
+            gender = str(gender).strip().lower() or "unknown"
+            age = str(age).strip().lower() or "adult"
+            if gender not in ("male", "female", "unknown"):
+                raise ValueError(f"Gender of {name!r} must be male, female or unknown")
+            if age not in script_voice.AGES:
+                raise ValueError(f"Age of {name!r} must be adult or kid")
+            profiles[name] = dubbing.SpeakerProfile(
+                name=name, gender=gender, age=age, voice_mode="clone_first",
+                description=str(description).strip() or script_voice.voice_description(gender, age),
+            )
+        lines = []
+        for row in _table_rows(line_rows):
+            idx, start, end, speaker, emotion, text = (list(row) + [""] * 6)[:6]
+            if not str(text).strip():
+                continue
+            speaker = str(speaker).strip() or script_voice.DEFAULT_SPEAKER
+            lines.append(
+                dubbing.SubtitleLine(
+                    index=int(float(idx)) if str(idx).strip() else len(lines) + 1,
+                    start=dubbing.parse_timestamp(start),
+                    end=dubbing.parse_timestamp(end),
+                    text=str(text).strip(),
+                    speaker=speaker,
+                    gender=profiles[speaker].gender if speaker in profiles else "unknown",
+                    emotion=str(emotion or "").replace("(guessed)", "").strip() or "neutral",
+                )
+            )
+        if not lines:
+            raise ValueError("The lines table is empty.")
+        return lines, profiles
+
+    def _run(
+        workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
+        max_pause, cfg_value, dit_steps,
+        progress, only=None, new_voices=(),
+    ):
+        if not workdir:
+            raise gr.Error("Please upload an SRT and click Analyze first.")
+        try:
+            lines, profiles = _read_tables(speaker_rows, line_rows)
+            progress(0, desc="Loading VoxCPM...")
+            voicer = script_voice.ScriptVoicer(demo.get_or_load_voxcpm(), workdir)
+            if verify_voice:
+                progress(0, desc="Loading voice identification model (CAM++)...")
+                if "model" not in speaker_models:
+                    speaker_models["model"] = dubbing.load_speaker_model()
+                voicer.speaker_model = speaker_models["model"]
+            options = dubbing.DubOptions(
+                verify_voice=bool(verify_voice),
+                max_attempts=int(max_tries),
+                first_line_attempts=max(int(max_tries), 12),
+                max_speedup=float(max_speedup),
+                pad_to_slot=bool(pad_to_slot),
+                remove_silence=bool(remove_silence),
+                max_pause=float(max_pause),
+                # Each line must stay close to its speaker's voice in pitch and timbre.
+                pitch_tolerance=2.0,
+                min_consistency=0.6,
+                cfg_value=float(cfg_value),
+                inference_timesteps=int(dit_steps),
+            )
+
+            def _on_progress(i, n, line):
+                verb = "Re-voicing" if new_voices else "Regenerating" if only else "Line"
+                progress(i / max(n, 1), desc=f"{verb} {min(i + 1, n)}/{n} — #{line.index} {line.speaker}")
+
+            out = os.path.join(workdir, "script.wav")
+            result = voicer.voice(
+                lines, profiles, out, options, progress=_on_progress, only=only, new_voices=new_voices
+            )
+            for message in result.warnings:
+                gr.Warning(message, duration=None)
+            zip_path = shutil.make_archive(os.path.join(workdir, "script_lines"), "zip", result.lines_dir)
+            line_files = sorted(str(p) for p in Path(result.lines_dir).glob("*.wav"))
+        except gr.Error:
+            raise
+        except Exception as e:
+            logger.exception("SRT voicing failed")
+            raise gr.Error(str(e))
+
+        report_rows = [
+            [
+                r["index"], r["speaker"], r["gender"], r["age"],
+                r["emotion"] + (" (guessed)" if r.get("emotion_guessed") else ""),
+                r["mode"] + (f" · regenerated ×{r['regenerated']}" if r.get("regenerated") else ""),
+                ("" if r.get("voice_match") is None else f"{r['voice_match']:.2f}")
+                + ("" if r.get("consistency") is None else f" (vs own lines {r['consistency']:.2f})")
+                + ("" if r.get("voice_ok", True) else " ⚠"),
+                f"{r.get('pitch_hz') or ''}" + ("" if r.get("gender_ok", True) else " ⚠ unclear gender"),
+                _line_status(r), r["attempts"], round(r["end"] - r["start"], 2), r["generated_s"], r["text"],
+            ]
+            for r in result.report
+        ]
+        failed = script_voice.failed_lines(result.report)
+        retry_choices = [
+            (f"#{r['index']} {r['speaker']}" + (" ⚠" if r["index"] in failed else "") + f" — {r['text'][:30]}", str(r["index"]))
+            for r in result.report
+        ]
+        if new_voices:
+            redone = {r["index"] for r in result.report if r["speaker"] in new_voices}
+        else:
+            redone = set(only or ())
+        picked = next((f for f in line_files if int(Path(f).name[:4]) in redone), line_files[0] if line_files else None)
+        notes = _notes(result.warnings, done=True)
+        if new_voices:
+            notes = f"🎭 New voice for {', '.join(sorted(new_voices))} — all of their lines were regenerated.\n\n" + notes
+        elif only:
+            notes = f"🔁 Regenerated line(s) {', '.join(f'#{i}' for i in sorted(only))}.\n\n" + notes
+        speakers = list(dict.fromkeys(r["speaker"] for r in result.report))
+        voice_speaker = next(iter(new_voices)) if new_voices else speakers[0]
+        return (
+            result.audio_path,
+            gr.update(value=zip_path, interactive=True, label=f"⬇️ Download all {len(line_files)} lines (.zip)"),
+            line_files,
+            gr.update(choices=[(Path(f).stem, f) for f in line_files], value=picked),
+            picked,
+            result.tagged_srt_path,
+            report_rows,
+            notes,
+            gr.update(choices=retry_choices, value=[str(i) for i in failed]),
+            gr.update(choices=speakers, value=voice_speaker),
+            result.voices,
+            result.voices.get(voice_speaker),
+        )
+
+    def _generate(
+        workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
+        max_pause, cfg_value, dit_steps,
+        progress=gr.Progress(),
+    ):
+        return _run(
+            workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
+        max_pause, cfg_value, dit_steps,
+            progress,
+        )
+
+    def _regenerate(
+        selected, workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot,
+        remove_silence, max_pause, cfg_value, dit_steps, progress=gr.Progress(),
+    ):
+        if not selected:
+            raise gr.Error("Choose the line(s) to regenerate first (failed lines ⚠ are selected after Generate).")
+        return _run(
+            workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
+        max_pause, cfg_value, dit_steps,
+            progress, only={int(v) for v in selected},
+        )
+
+    def _revoice(
+        speaker, workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot,
+        remove_silence, max_pause, cfg_value, dit_steps, progress=gr.Progress(),
+    ):
+        if not speaker:
+            raise gr.Error("Choose the speaker who needs a new voice first (speakers are listed after Generate).")
+        return _run(
+            workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
+        max_pause, cfg_value, dit_steps,
+            progress, only=(), new_voices={speaker},
+        )
+
+    gr.Markdown(_SRT_INSTRUCTIONS)
+    workdir_state = gr.State(None)
+    voices_state = gr.State({})
+    with gr.Row():
+        with gr.Column():
+            srt_input = gr.File(label="📝 Tagged subtitles (.srt)", file_types=[".srt"], type="filepath")
+            guess_emotion = gr.Checkbox(
+                value=True,
+                label="Guess missing emotions",
+                info="From punctuation (?!, !, …) and English keywords; marked (guessed) so you can check them",
+                elem_classes=["switch-toggle"],
+            )
+            analyze_btn = gr.Button("1️⃣ Analyze script", variant="secondary")
+            tagged_output = gr.File(label="Tagged SRT (every line with speaker, gender, age and emotion)")
+        with gr.Column():
+            audio_output = gr.Audio(label="Combined track (on the SRT timing)", type="filepath")
+
+    with gr.Row():
+        with gr.Column():
+            zip_output = gr.DownloadButton("⬇️ Download all lines (.zip)", variant="primary", interactive=False)
+            line_files_output = gr.File(
+                label="⬇️ Every line as its own file — click a file to download just that one", file_count="multiple"
+            )
+        with gr.Column():
+            line_picker = gr.Dropdown(choices=[], label="🎧 Listen to a line", interactive=True)
+            line_player = gr.Audio(label="Selected line", type="filepath")
+
+    speakers_table = gr.Dataframe(
+        headers=_SRT_SPEAKER_HEADERS,
+        datatype=["str", "str", "str", "str", "number"],
+        label="🎭 Speakers — gender: male / female / unknown, age: adult / kid; the description is the voice prompt",
+        interactive=True,
+        wrap=True,
+    )
+    lines_table = gr.Dataframe(
+        headers=_SRT_LINE_HEADERS,
+        datatype=["number", "number", "number", "str", "str", "str"],
+        label="💬 Lines — edit speaker or emotion (happy, sad, angry, fearful, surprised, … or any word)",
+        interactive=True,
+        wrap=True,
+        max_height=420,
+    )
+    with gr.Accordion("⚙️ Settings", open=False):
+        with gr.Row():
+            verify_voice = gr.Checkbox(
+                value=True,
+                label="Check every line matches its speaker's first line",
+                info="CAM++ voice check; regenerates until consistent",
+            )
+            max_tries = gr.Slider(1, 20, value=8, step=1, label="Max tries per line", info="Each first line gets at least 12")
+            max_speedup = gr.Slider(
+                1.0, 1.5, value=1.1, step=0.05, label="Max speed-up to fit a line (combined track)",
+                info="Longer lines push the next lines later instead of being squeezed (squeezing changes the voice)",
+            )
+            pad_to_slot = gr.Checkbox(
+                value=False,
+                label="Pad short lines with silence",
+                info="Off: every line file keeps its natural length. On: silence after the speech up to the slot length",
+            )
+        with gr.Row():
+            remove_silence = gr.Checkbox(
+                value=True,
+                label="Remove silences",
+                info="Cut the silence before and after each line and shorten long pauses inside it",
+            )
+            max_pause = gr.Slider(
+                0.05, 0.6, value=0.2, step=0.05, label="Longest pause kept inside a line (s)",
+                info="Pauses longer than this are shortened to it",
+            )
+        with gr.Row():
+            cfg_value = gr.Slider(1.0, 3.0, value=2.0, step=0.1, label=I18N("cfg_label"))
+            dit_steps = gr.Slider(1, 50, value=10, step=1, label=I18N("dit_steps_label"))
+    generate_btn = gr.Button("2️⃣ Generate all lines", variant="primary", size="lg")
+    with gr.Row():
+        retry_picker = gr.Dropdown(
+            choices=[],
+            multiselect=True,
+            label="🔁 Lines to regenerate — failed lines (⚠) are selected after Generate; edit a line's text or "
+            "emotion in the table first if you like",
+            scale=4,
+        )
+        retry_btn = gr.Button("🔁 Regenerate selected lines", variant="secondary", scale=1)
+    with gr.Row():
+        revoice_picker = gr.Dropdown(
+            choices=[],
+            label="🎭 New voice for a speaker — their voice is designed again (from their gender, age and description "
+            "in the Speakers table) and all of their lines are regenerated",
+            scale=2,
+        )
+        voice_preview = gr.Audio(label="This speaker's voice (what all their lines copy)", type="filepath", scale=2)
+        revoice_btn = gr.Button("🎭 New voice — redo all their lines", variant="secondary", scale=1)
+    notes_box = gr.Markdown()
+    report_table = gr.Dataframe(headers=_SRT_REPORT_HEADERS, label="📊 Report", interactive=False, wrap=True)
+
+    analyze_btn.click(
+        fn=_analyze,
+        inputs=[srt_input, guess_emotion],
+        outputs=[speakers_table, lines_table, tagged_output, workdir_state, notes_box],
+    )
+    settings = [
+        workdir_state, speakers_table, lines_table, verify_voice, max_tries, max_speedup, pad_to_slot,
+        remove_silence, max_pause, cfg_value, dit_steps,
+    ]
+    results = [
+        audio_output, zip_output, line_files_output, line_picker, line_player, tagged_output, report_table, notes_box,
+        retry_picker, revoice_picker, voices_state, voice_preview,
+    ]
+    generate_btn.click(fn=_generate, inputs=settings, outputs=results, api_name="voice_srt")
+    retry_btn.click(fn=_regenerate, inputs=[retry_picker] + settings, outputs=results, api_name="regenerate_srt_lines")
+    revoice_btn.click(fn=_revoice, inputs=[revoice_picker] + settings, outputs=results, api_name="revoice_srt_speaker")
+    line_picker.change(fn=lambda path: path, inputs=line_picker, outputs=line_player)
+    revoice_picker.change(
+        fn=lambda name, voices: (voices or {}).get(name), inputs=[revoice_picker, voices_state], outputs=voice_preview
+    )
+
+
 # ---------- UI ----------
 
 
@@ -427,129 +806,134 @@ def create_demo_interface(demo: VoxCPMDemo):
             "</div>"
         )
 
-        gr.Markdown(I18N("usage_instructions"))
+        with gr.Tabs():
+            with gr.Tab(I18N("tab_tts")):
+                gr.Markdown(I18N("usage_instructions"))
 
-        with gr.Row():
-            with gr.Column():
-                reference_wav = gr.Audio(
-                    sources=["upload", "microphone"],
-                    type="filepath",
-                    label=I18N("reference_audio_label"),
-                )
-                show_prompt_text = gr.Checkbox(
-                    value=False,
-                    label=I18N("show_prompt_text_label"),
-                    info=I18N("show_prompt_text_info"),
-                    elem_classes=["switch-toggle"],
-                )
-                prompt_text = gr.Textbox(
-                    value="",
-                    label=I18N("prompt_text_label"),
-                    placeholder=I18N("prompt_text_placeholder"),
-                    lines=2,
-                    visible=False,
-                )
-                control_instruction = gr.Textbox(
-                    value="",
-                    label=I18N("control_label"),
-                    placeholder=I18N("control_placeholder"),
-                    lines=2,
-                )
-                text = gr.Textbox(
-                    value=DEFAULT_TARGET_TEXT,
-                    label=I18N("target_text_label"),
-                    lines=3,
-                )
-
-                with gr.Accordion(I18N("advanced_settings_title"), open=False):
-                    DoDenoisePromptAudio = gr.Checkbox(
-                        value=False,
-                        label=I18N("ref_denoise_label"),
-                        elem_classes=["switch-toggle"],
-                        info=I18N("ref_denoise_info"),
-                    )
-                    DoNormalizeText = gr.Checkbox(
-                        value=False,
-                        label=I18N("normalize_label"),
-                        elem_classes=["switch-toggle"],
-                        info=I18N("normalize_info"),
-                    )
-                    cfg_value = gr.Slider(
-                        minimum=1.0,
-                        maximum=3.0,
-                        value=2.0,
-                        step=0.1,
-                        label=I18N("cfg_label"),
-                        info=I18N("cfg_info"),
-                    )
-                    dit_steps = gr.Slider(
-                        minimum=1,
-                        maximum=50,
-                        value=10,
-                        step=1,
-                        label=I18N("dit_steps_label"),
-                        info=I18N("dit_steps_info"),
-                    )
-                    with gr.Row():
-                        seed_value = gr.Number(
-                            value=random.randint(0, 2**32 - 1),
-                            precision=0,
-                            label=I18N("seed_label"),
-                            info=I18N("seed_info"),
-                            interactive=False,
+                with gr.Row():
+                    with gr.Column():
+                        reference_wav = gr.Audio(
+                            sources=["upload", "microphone"],
+                            type="filepath",
+                            label=I18N("reference_audio_label"),
                         )
-                        random_seed = gr.Checkbox(
-                            value=True,
-                            label=I18N("random_seed_label"),
+                        show_prompt_text = gr.Checkbox(
+                            value=False,
+                            label=I18N("show_prompt_text_label"),
+                            info=I18N("show_prompt_text_info"),
                             elem_classes=["switch-toggle"],
-                            info=I18N("random_seed_info"),
+                        )
+                        prompt_text = gr.Textbox(
+                            value="",
+                            label=I18N("prompt_text_label"),
+                            placeholder=I18N("prompt_text_placeholder"),
+                            lines=2,
+                            visible=False,
+                        )
+                        control_instruction = gr.Textbox(
+                            value="",
+                            label=I18N("control_label"),
+                            placeholder=I18N("control_placeholder"),
+                            lines=2,
+                        )
+                        text = gr.Textbox(
+                            value=DEFAULT_TARGET_TEXT,
+                            label=I18N("target_text_label"),
+                            lines=3,
                         )
 
-                run_btn = gr.Button(I18N("generate_btn"), variant="primary", size="lg")
+                        with gr.Accordion(I18N("advanced_settings_title"), open=False):
+                            DoDenoisePromptAudio = gr.Checkbox(
+                                value=False,
+                                label=I18N("ref_denoise_label"),
+                                elem_classes=["switch-toggle"],
+                                info=I18N("ref_denoise_info"),
+                            )
+                            DoNormalizeText = gr.Checkbox(
+                                value=False,
+                                label=I18N("normalize_label"),
+                                elem_classes=["switch-toggle"],
+                                info=I18N("normalize_info"),
+                            )
+                            cfg_value = gr.Slider(
+                                minimum=1.0,
+                                maximum=3.0,
+                                value=2.0,
+                                step=0.1,
+                                label=I18N("cfg_label"),
+                                info=I18N("cfg_info"),
+                            )
+                            dit_steps = gr.Slider(
+                                minimum=1,
+                                maximum=50,
+                                value=10,
+                                step=1,
+                                label=I18N("dit_steps_label"),
+                                info=I18N("dit_steps_info"),
+                            )
+                            with gr.Row():
+                                seed_value = gr.Number(
+                                    value=random.randint(0, 2**32 - 1),
+                                    precision=0,
+                                    label=I18N("seed_label"),
+                                    info=I18N("seed_info"),
+                                    interactive=False,
+                                )
+                                random_seed = gr.Checkbox(
+                                    value=True,
+                                    label=I18N("random_seed_label"),
+                                    elem_classes=["switch-toggle"],
+                                    info=I18N("random_seed_info"),
+                                )
 
-            with gr.Column():
-                audio_output = gr.Audio(label=I18N("generated_audio_label"))
-                gr.Markdown(I18N("examples_footer"))
+                        run_btn = gr.Button(I18N("generate_btn"), variant="primary", size="lg")
 
-        show_prompt_text.change(
-            fn=_on_toggle_instant,
-            inputs=[show_prompt_text],
-            outputs=[prompt_text, control_instruction],
-        ).then(
-            fn=_run_asr_if_needed,
-            inputs=[show_prompt_text, reference_wav],
-            outputs=[prompt_text],
-        )
+                    with gr.Column():
+                        audio_output = gr.Audio(label=I18N("generated_audio_label"))
+                        gr.Markdown(I18N("examples_footer"))
 
-        random_seed.change(
-            fn=_on_random_seed_toggle,
-            inputs=[random_seed],
-            outputs=[seed_value],
-        )
+                show_prompt_text.change(
+                    fn=_on_toggle_instant,
+                    inputs=[show_prompt_text],
+                    outputs=[prompt_text, control_instruction],
+                ).then(
+                    fn=_run_asr_if_needed,
+                    inputs=[show_prompt_text, reference_wav],
+                    outputs=[prompt_text],
+                )
 
-        run_btn.click(
-            fn=_prepare_seed,
-            inputs=[random_seed, seed_value],
-            outputs=[seed_value],
-            show_progress=False,
-        ).then(
-            fn=_generate,
-            inputs=[
-                text,
-                control_instruction,
-                reference_wav,
-                show_prompt_text,
-                prompt_text,
-                cfg_value,
-                DoNormalizeText,
-                DoDenoisePromptAudio,
-                dit_steps,
-                seed_value,
-            ],
-            outputs=[audio_output, seed_value],
-            show_progress=True,
-            api_name="generate",
-        )
+                random_seed.change(
+                    fn=_on_random_seed_toggle,
+                    inputs=[random_seed],
+                    outputs=[seed_value],
+                )
+
+                run_btn.click(
+                    fn=_prepare_seed,
+                    inputs=[random_seed, seed_value],
+                    outputs=[seed_value],
+                    show_progress=False,
+                ).then(
+                    fn=_generate,
+                    inputs=[
+                        text,
+                        control_instruction,
+                        reference_wav,
+                        show_prompt_text,
+                        prompt_text,
+                        cfg_value,
+                        DoNormalizeText,
+                        DoDenoisePromptAudio,
+                        dit_steps,
+                        seed_value,
+                    ],
+                    outputs=[audio_output, seed_value],
+                    show_progress=True,
+                    api_name="generate",
+                )
+
+            with gr.Tab(I18N("tab_srt")):
+                build_srt_tab(demo)
 
     return interface
 
