@@ -478,6 +478,9 @@ class ScriptVoicer(VideoDubber):
                 "issues": best.get("issues", []),
                 "regenerated": round_,
             }
+            # Saved after every line, so an interrupted run keeps (and can show) the lines already made.
+            state["refs"] = refs
+            state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         if progress:
             progress(len(todo), len(todo), todo[-1] if todo else lines[-1])
         state["refs"] = refs
@@ -578,6 +581,34 @@ def revoice_speakers(
     return voicer.voice(lines, profiles, output_path, options, progress, only=(), new_voices=speakers)
 
 
+def load_results(workdir: str | os.PathLike, output_path: str | os.PathLike) -> Optional[ScriptResult]:
+    """The results of the last finished :meth:`ScriptVoicer.voice` run in ``workdir`` (``None`` if there is none)."""
+    workdir = Path(workdir)
+    stem = Path(output_path).with_suffix("")
+    report_path, audio_path = workdir / "report.json", Path(str(stem) + ".wav")
+    if not report_path.exists() or not audio_path.exists():
+        return None
+    state_path = workdir / "script_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    return ScriptResult(
+        str(audio_path),
+        str(stem) + "_lines",
+        str(stem) + "_tagged.srt",
+        json.loads(report_path.read_text(encoding="utf-8")),
+        [],
+        voices={n: p for n, p in state.get("refs", {}).items() if Path(p).exists()},
+    )
+
+
+def generated_lines(workdir: str | os.PathLike) -> set[int]:
+    """Line numbers already generated in ``workdir`` (also while a run is still going or after it stopped)."""
+    state_path = Path(workdir) / "script_state.json"
+    if not state_path.exists():
+        return set()
+    entries = json.loads(state_path.read_text(encoding="utf-8")).get("entries", {})
+    return {int(i) for i in entries if (Path(workdir) / "raw" / f"{int(i):04d}.wav").exists()}
+
+
 def failed_lines(report: list[dict]) -> list[int]:
     """Line numbers that are not consistent with their speaker or not clearly their gender."""
     return [r["index"] for r in report if not r.get("voice_ok", True) or not r.get("gender_ok", True)]
@@ -595,6 +626,8 @@ __all__ = [
     "ScriptVoicer",
     "VoiceTag",
     "failed_lines",
+    "generated_lines",
+    "load_results",
     "revoice_speakers",
     "format_tagged_srt",
     "guess_emotion",

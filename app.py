@@ -1,7 +1,10 @@
 import os
 import re
 import sys
+import json
+import time
 import tempfile
+import threading
 import logging
 import random
 import numpy as np
@@ -390,7 +393,9 @@ _SRT_INSTRUCTIONS = (
     "lines** to redo just those lines with new seeds (same speaker voice); the combined track is rebuilt.\n"
     "5. A speaker's voice doesn't fit them? Choose them under **🎭 New voice for a speaker** (edit their gender, age or "
     "description in the Speakers table first if you like) — their voice is designed again and all of their lines are "
-    "regenerated."
+    "regenerated.\n\n"
+    "💾 Your project is saved as you go: if you close or reload this tab, reopening the page brings back your tables and "
+    "every line already generated, and a generation in progress keeps running in the background."
 )
 _SRT_SPEAKER_HEADERS = ["Speaker", "Gender", "Age", "Voice description", "Lines"]
 _SRT_LINE_HEADERS = ["#", "Start", "End", "Speaker", "Emotion", "Text"]
@@ -413,12 +418,41 @@ def _line_status(r: dict) -> str:
     return status
 
 
-def build_srt_tab(demo: VoxCPMDemo):
+# SRT → Speech projects live here (not in a temp folder), so a closed or reloaded tab can pick them up again.
+SRT_PROJECTS_DIR = Path(os.environ.get("VOXCPM_PROJECTS_DIR", Path.home() / ".voxcpm" / "srt_projects"))
+# Background generation jobs by project folder: they keep running when the browser tab is closed.
+_SRT_JOBS: dict = {}
+_SRT_JOBS_LOCK = threading.Lock()
+
+
+def _srt_current_project() -> Optional[str]:
+    pointer = SRT_PROJECTS_DIR / "current.json"
+    try:
+        workdir = json.loads(pointer.read_text(encoding="utf-8"))["workdir"]
+    except (OSError, ValueError, KeyError):
+        return None
+    return workdir if Path(workdir, "tables.json").exists() else None
+
+
+def _srt_save_tables(workdir: str, speaker_rows, line_rows, tagged: Optional[str] = None) -> None:
+    path = Path(workdir, "tables.json")
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    data["speakers"] = [list(r) for r in _table_rows(speaker_rows)]
+    data["lines"] = [list(r) for r in _table_rows(line_rows)]
+    if tagged:
+        data["tagged"] = tagged
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    SRT_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    (SRT_PROJECTS_DIR / "current.json").write_text(json.dumps({"workdir": workdir}), encoding="utf-8")
+
+
+def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
     import shutil
 
     from voxcpm import dubbing, script_voice
 
     speaker_models = {}
+    no_change = gr.update()
 
     def _analyze(srt_path, guess_emotion):
         if not srt_path:
@@ -432,9 +466,12 @@ def build_srt_tab(demo: VoxCPMDemo):
         problems = script_voice.find_srt_problems(srt_path)
         for message in problems:
             gr.Warning(message, duration=None)
-        workdir = tempfile.mkdtemp(prefix="voxcpm_srt_")
+        stem = re.sub(r"[^\w\-]+", "_", Path(srt_path).stem)[:40] or "script"
+        workdir = str(SRT_PROJECTS_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}_{stem}")
+        Path(workdir).mkdir(parents=True, exist_ok=True)
         tagged = os.path.join(workdir, Path(srt_path).stem + "_tagged.srt")
         Path(tagged).write_text(script_voice.format_tagged_srt(lines, profiles), encoding="utf-8")
+        speaker_rows = script_voice.speaker_summary(lines, profiles)
         line_rows = [
             [
                 l.index, round(l.start, 3), round(l.end, 3), l.speaker,
@@ -442,7 +479,8 @@ def build_srt_tab(demo: VoxCPMDemo):
             ]
             for l in lines
         ]
-        return script_voice.speaker_summary(lines, profiles), line_rows, tagged, workdir, _notes(problems)
+        _srt_save_tables(workdir, speaker_rows, line_rows, tagged)
+        return speaker_rows, line_rows, tagged, workdir, _notes(problems)
 
     def _read_tables(speaker_rows, line_rows):
         profiles = {}
@@ -482,55 +520,24 @@ def build_srt_tab(demo: VoxCPMDemo):
             raise ValueError("The lines table is empty.")
         return lines, profiles
 
-    def _run(
-        workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
-        max_pause, cfg_value, dit_steps,
-        progress, only=None, new_voices=(),
-    ):
-        if not workdir:
-            raise gr.Error("Please upload an SRT and click Analyze first.")
-        try:
-            lines, profiles = _read_tables(speaker_rows, line_rows)
-            progress(0, desc="Loading VoxCPM...")
-            voicer = script_voice.ScriptVoicer(demo.get_or_load_voxcpm(), workdir)
-            if verify_voice:
-                progress(0, desc="Loading voice identification model (CAM++)...")
-                if "model" not in speaker_models:
-                    speaker_models["model"] = dubbing.load_speaker_model()
-                voicer.speaker_model = speaker_models["model"]
-            options = dubbing.DubOptions(
-                verify_voice=bool(verify_voice),
-                max_attempts=int(max_tries),
-                first_line_attempts=max(int(max_tries), 12),
-                max_speedup=float(max_speedup),
-                pad_to_slot=bool(pad_to_slot),
-                remove_silence=bool(remove_silence),
-                max_pause=float(max_pause),
-                # Each line must stay close to its speaker's voice in pitch and timbre.
-                pitch_tolerance=2.0,
-                min_consistency=0.6,
-                cfg_value=float(cfg_value),
-                inference_timesteps=int(dit_steps),
-            )
+    def _retry_choices(line_rows, report, done):
+        """Every line for the regenerate picker; failed (⚠) and not yet generated (⏳) lines are pre-selected."""
+        failed = set(script_voice.failed_lines(report)) if report else set()
+        by_index = {r["index"]: r for r in report or []}
+        choices, selected = [], []
+        for row in _table_rows(line_rows):
+            index = int(float(row[0]))
+            text, speaker = str(row[5]), str(row[3])
+            mark = " ⏳" if index not in done else " ⚠" if index in failed else ""
+            choices.append((f"#{index} {by_index.get(index, {}).get('speaker', speaker)}{mark} — {text[:30]}", str(index)))
+            if mark:
+                selected.append(str(index))
+        return gr.update(choices=choices, value=selected)
 
-            def _on_progress(i, n, line):
-                verb = "Re-voicing" if new_voices else "Regenerating" if only else "Line"
-                progress(i / max(n, 1), desc=f"{verb} {min(i + 1, n)}/{n} — #{line.index} {line.speaker}")
-
-            out = os.path.join(workdir, "script.wav")
-            result = voicer.voice(
-                lines, profiles, out, options, progress=_on_progress, only=only, new_voices=new_voices
-            )
-            for message in result.warnings:
-                gr.Warning(message, duration=None)
-            zip_path = shutil.make_archive(os.path.join(workdir, "script_lines"), "zip", result.lines_dir)
-            line_files = sorted(str(p) for p in Path(result.lines_dir).glob("*.wav"))
-        except gr.Error:
-            raise
-        except Exception as e:
-            logger.exception("SRT voicing failed")
-            raise gr.Error(str(e))
-
+    def _outputs(result, line_rows, notes, focus=()):
+        """Everything the page shows for a finished run (also used to restore a reopened page)."""
+        line_files = sorted(str(p) for p in Path(result.lines_dir).glob("*.wav"))
+        zip_path = shutil.make_archive(str(Path(result.lines_dir).with_name("script_lines")), "zip", result.lines_dir)
         report_rows = [
             [
                 r["index"], r["speaker"], r["gender"], r["age"],
@@ -544,23 +551,10 @@ def build_srt_tab(demo: VoxCPMDemo):
             ]
             for r in result.report
         ]
-        failed = script_voice.failed_lines(result.report)
-        retry_choices = [
-            (f"#{r['index']} {r['speaker']}" + (" ⚠" if r["index"] in failed else "") + f" — {r['text'][:30]}", str(r["index"]))
-            for r in result.report
-        ]
-        if new_voices:
-            redone = {r["index"] for r in result.report if r["speaker"] in new_voices}
-        else:
-            redone = set(only or ())
-        picked = next((f for f in line_files if int(Path(f).name[:4]) in redone), line_files[0] if line_files else None)
-        notes = _notes(result.warnings, done=True)
-        if new_voices:
-            notes = f"🎭 New voice for {', '.join(sorted(new_voices))} — all of their lines were regenerated.\n\n" + notes
-        elif only:
-            notes = f"🔁 Regenerated line(s) {', '.join(f'#{i}' for i in sorted(only))}.\n\n" + notes
+        picked = next((f for f in line_files if int(Path(f).name[:4]) in set(focus)), line_files[0] if line_files else None)
         speakers = list(dict.fromkeys(r["speaker"] for r in result.report))
-        voice_speaker = next(iter(new_voices)) if new_voices else speakers[0]
+        voice_speaker = next((r["speaker"] for r in result.report if r["index"] in set(focus)), speakers[0] if speakers else None)
+        done = {r["index"] for r in result.report}
         return (
             result.audio_path,
             gr.update(value=zip_path, interactive=True, label=f"⬇️ Download all {len(line_files)} lines (.zip)"),
@@ -570,21 +564,131 @@ def build_srt_tab(demo: VoxCPMDemo):
             result.tagged_srt_path,
             report_rows,
             notes,
-            gr.update(choices=retry_choices, value=[str(i) for i in failed]),
+            _retry_choices(line_rows, result.report, done),
             gr.update(choices=speakers, value=voice_speaker),
             result.voices,
-            result.voices.get(voice_speaker),
+            result.voices.get(voice_speaker) if voice_speaker else None,
         )
+
+    def _partial_outputs(workdir, line_rows, notes, tagged=None):
+        """What the page shows for a run that is still going or stopped part-way: the lines made so far."""
+        lines_dir = Path(workdir, "script_lines")
+        line_files = sorted(str(p) for p in lines_dir.glob("*.wav")) if lines_dir.exists() else []
+        done = script_voice.generated_lines(workdir)
+        return (
+            no_change,
+            no_change,
+            line_files,
+            gr.update(choices=[(Path(f).stem, f) for f in line_files], value=line_files[0] if line_files else None),
+            line_files[0] if line_files else None,
+            tagged if tagged else no_change,
+            no_change,
+            notes,
+            _retry_choices(line_rows, [], done),
+            no_change,
+            no_change,
+            no_change,
+        )
+
+    def _job_worker(job, workdir, lines, profiles, options, only, new_voices, verify_voice):
+        try:
+            job["desc"] = "Loading VoxCPM..."
+            voicer = script_voice.ScriptVoicer(demo.get_or_load_voxcpm(), workdir)
+            if verify_voice:
+                job["desc"] = "Loading voice identification model (CAM++)..."
+                if "model" not in speaker_models:
+                    speaker_models["model"] = dubbing.load_speaker_model()
+                voicer.speaker_model = speaker_models["model"]
+            verb = "Re-voicing" if new_voices else "Regenerating" if only else "Line"
+
+            def _on_progress(i, n, line):
+                job["i"], job["n"] = i, n
+                job["desc"] = f"{verb} {min(i + 1, n)}/{n} — #{line.index} {line.speaker}"
+
+            out = os.path.join(workdir, "script.wav")
+            job["result"] = voicer.voice(
+                lines, profiles, out, options, progress=_on_progress, only=only, new_voices=new_voices
+            )
+            job["status"] = "done"
+        except Exception as e:  # reported to the page that is (or will be) open
+            logger.exception("SRT voicing failed")
+            job["error"], job["status"] = str(e), "failed"
+
+    def _job_note(job) -> str:
+        return (
+            f"⏳ **Generating in the background — {job['desc'] or 'starting...'}**\n\n"
+            "It keeps going even if you close this tab; reopen the page to see the results."
+        )
+
+    def _run(
+        workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
+        max_pause, cfg_value, dit_steps, progress, only=None, new_voices=(),
+    ):
+        if not workdir:
+            raise gr.Error("Please upload an SRT and click Analyze first.")
+        try:
+            lines, profiles = _read_tables(speaker_rows, line_rows)
+        except Exception as e:
+            raise gr.Error(str(e))
+        if only is not None:
+            # Lines that were never generated (e.g. the run was stopped) are always finished too.
+            only = set(only) | ({l.index for l in lines} - script_voice.generated_lines(workdir))
+        options = dubbing.DubOptions(
+            verify_voice=bool(verify_voice),
+            max_attempts=int(max_tries),
+            first_line_attempts=max(int(max_tries), 12),
+            max_speedup=float(max_speedup),
+            pad_to_slot=bool(pad_to_slot),
+            remove_silence=bool(remove_silence),
+            max_pause=float(max_pause),
+            # Each line must stay close to its speaker's voice in pitch and timbre.
+            pitch_tolerance=2.0,
+            min_consistency=0.6,
+            cfg_value=float(cfg_value),
+            inference_timesteps=int(dit_steps),
+        )
+        with _SRT_JOBS_LOCK:
+            if any(j["status"] == "running" for j in _SRT_JOBS.values()):
+                raise gr.Error("A generation is already running — wait for it to finish (its progress is shown here).")
+            job = {"status": "running", "i": 0, "n": len(lines), "desc": "", "error": None, "result": None,
+                   "only": only, "new_voices": set(new_voices)}
+            _SRT_JOBS[workdir] = job
+        _srt_save_tables(workdir, speaker_rows, line_rows)
+        threading.Thread(
+            target=_job_worker,
+            args=(job, workdir, lines, profiles, options, only, set(new_voices), bool(verify_voice)),
+            daemon=True,
+        ).start()
+        # Follow the job; if the tab is closed it simply carries on in the background.
+        while job["status"] == "running":
+            progress(job["i"] / max(job["n"], 1), desc=job["desc"] or "Starting...")
+            time.sleep(0.5)
+        return _finished(job, workdir, line_rows)
+
+    def _finished(job, workdir, line_rows):
+        if job["status"] == "failed":
+            raise gr.Error(job["error"])
+        result = job["result"]
+        for message in result.warnings:
+            gr.Warning(message, duration=None)
+        notes = _notes(result.warnings, done=True)
+        if job["new_voices"]:
+            notes = f"🎭 New voice for {', '.join(sorted(job['new_voices']))} — all of their lines were regenerated.\n\n" + notes
+            focus = [r["index"] for r in result.report if r["speaker"] in job["new_voices"]]
+        elif job["only"]:
+            notes = f"🔁 Regenerated line(s) {', '.join(f'#{i}' for i in sorted(job['only']))}.\n\n" + notes
+            focus = sorted(job["only"])
+        else:
+            focus = []
+        return _outputs(result, line_rows, notes, focus)
 
     def _generate(
         workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
-        max_pause, cfg_value, dit_steps,
-        progress=gr.Progress(),
+        max_pause, cfg_value, dit_steps, progress=gr.Progress(),
     ):
         return _run(
             workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
-        max_pause, cfg_value, dit_steps,
-            progress,
+            max_pause, cfg_value, dit_steps, progress,
         )
 
     def _regenerate(
@@ -592,11 +696,10 @@ def build_srt_tab(demo: VoxCPMDemo):
         remove_silence, max_pause, cfg_value, dit_steps, progress=gr.Progress(),
     ):
         if not selected:
-            raise gr.Error("Choose the line(s) to regenerate first (failed lines ⚠ are selected after Generate).")
+            raise gr.Error("Choose the line(s) to regenerate first (failed ⚠ and unfinished ⏳ lines are pre-selected).")
         return _run(
             workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
-        max_pause, cfg_value, dit_steps,
-            progress, only={int(v) for v in selected},
+            max_pause, cfg_value, dit_steps, progress, only={int(v) for v in selected},
         )
 
     def _revoice(
@@ -607,13 +710,55 @@ def build_srt_tab(demo: VoxCPMDemo):
             raise gr.Error("Choose the speaker who needs a new voice first (speakers are listed after Generate).")
         return _run(
             workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
-        max_pause, cfg_value, dit_steps,
-            progress, only=(), new_voices={speaker},
+            max_pause, cfg_value, dit_steps, progress, only=(), new_voices={speaker},
         )
+
+    def _restore():
+        """Bring a reopened (or reloaded) page back to the last project: tables, generated lines and any run in progress."""
+        nothing = (no_change,) * 3 + (no_change,) * 12 + (gr.Timer(active=False),)
+        workdir = _srt_current_project()
+        if not workdir:
+            return nothing
+        tables = json.loads(Path(workdir, "tables.json").read_text(encoding="utf-8"))
+        speaker_rows, line_rows = tables.get("speakers", []), tables.get("lines", [])
+        tagged = tables.get("tagged")
+        head = (speaker_rows, line_rows, workdir)
+        job = _SRT_JOBS.get(workdir)
+        if job and job["status"] == "running":
+            return head + _partial_outputs(workdir, line_rows, _job_note(job), tagged) + (gr.Timer(active=True),)
+        output = os.path.join(workdir, "script.wav")
+        result = script_voice.load_results(workdir, output)
+        done = script_voice.generated_lines(workdir)
+        total = len(_table_rows(line_rows))
+        if result is not None and len(done) >= total:
+            note = "📂 Restored your last project."
+            if job and job["status"] == "failed":
+                note += f"\n\n⚠️ The last run stopped with an error: {job['error']}"
+            return head + _outputs(result, line_rows, note) + (gr.Timer(active=False),)
+        note = "📂 Restored your last project." + (
+            f" **{len(done)} of {total} lines** were generated before the run stopped — the unfinished lines (⏳) are "
+            "selected under **🔁 Lines to regenerate**; click **Regenerate selected lines** to finish them."
+            if done else " Click **Generate all lines** to start."
+        )
+        return head + _partial_outputs(workdir, line_rows, note, tagged) + (gr.Timer(active=False),)
+
+    def _poll(workdir, line_rows):
+        """While a background run goes on, update its progress; when it ends, show its results once."""
+        job = _SRT_JOBS.get(workdir) if workdir else None
+        if not job:
+            return (no_change,) * 12 + (gr.Timer(active=False),)
+        if job["status"] == "running":
+            return _partial_outputs(workdir, line_rows, _job_note(job)) + (gr.Timer(active=True),)
+        if job["status"] == "failed":
+            return (no_change,) * 7 + (f"⚠️ The run stopped with an error: {job['error']}",) + (no_change,) * 4 + (
+                gr.Timer(active=False),
+            )
+        return _finished(job, workdir, line_rows) + (gr.Timer(active=False),)
 
     gr.Markdown(_SRT_INSTRUCTIONS)
     workdir_state = gr.State(None)
     voices_state = gr.State({})
+    poll_timer = gr.Timer(2.0, active=False)
     with gr.Row():
         with gr.Column():
             srt_input = gr.File(label="📝 Tagged subtitles (.srt)", file_types=[".srt"], type="filepath")
@@ -725,6 +870,12 @@ def build_srt_tab(demo: VoxCPMDemo):
     revoice_picker.change(
         fn=lambda name, voices: (voices or {}).get(name), inputs=[revoice_picker, voices_state], outputs=voice_preview
     )
+    blocks.load(
+        fn=_restore,
+        outputs=[speakers_table, lines_table, workdir_state] + results + [poll_timer],
+        api_name="restore_srt",
+    )
+    poll_timer.tick(fn=_poll, inputs=[workdir_state, lines_table], outputs=results + [poll_timer])
 
 
 # ---------- UI ----------
@@ -933,7 +1084,7 @@ def create_demo_interface(demo: VoxCPMDemo):
                 )
 
             with gr.Tab(I18N("tab_srt")):
-                build_srt_tab(demo)
+                build_srt_tab(demo, interface)
 
     return interface
 
@@ -954,6 +1105,7 @@ def run_demo(
         i18n=I18N,
         theme=_APP_THEME,
         css=_CUSTOM_CSS,
+        allowed_paths=[str(SRT_PROJECTS_DIR)],
     )
 
 

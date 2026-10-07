@@ -374,6 +374,10 @@ voxcpm srt --srt script.srt --output script.wav --workdir work --regenerate 5,31
 The web demo has the same workflow in the **📝 SRT → Speech** tab: listen to and download every line (or all of
 them as one `.zip`), **🔁 Regenerate** the lines that need a look (they are pre-selected), or give a speaker a
 **🎭 New voice** (their voice is designed again and all of their lines are regenerated).
+Projects are saved as you go in `~/.voxcpm/srt_projects/` (set `VOXCPM_PROJECTS_DIR` to change it): closing or
+reloading the tab does not stop a generation, and reopening the page brings back the last project — its tables, every
+line already generated, and the progress of a run still going. Lines left unfinished (⏳) can be finished with
+**Regenerate**.
 
 ### Web Demo
 

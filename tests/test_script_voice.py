@@ -270,3 +270,26 @@ def test_line_files_have_their_silences_removed_by_default(tmp_path):
         wav, rate = sf.read(next(Path(result.lines_dir).glob("*.wav")), dtype="float32")
         assert len(wav) / rate == pytest.approx(expected, abs=0.08)
         assert result.report[0]["generated_s"] == pytest.approx(expected, abs=0.08)
+
+
+def test_progress_is_saved_per_line_and_results_can_be_reloaded(tmp_path):
+    lines, profiles = script_voice.read_script(dubbing.parse_srt(SCRIPT))
+
+    class Crash(_StubModel):
+        def generate(self, **kwargs):
+            if len([c for c in self.calls if c["reference_wav_path"]]) >= 2 and kwargs["reference_wav_path"]:
+                raise RuntimeError("stopped")
+            return super().generate(**kwargs)
+
+    workdir, out = tmp_path / "work", tmp_path / "work" / "script.wav"
+    opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1)
+    with pytest.raises(RuntimeError):
+        script_voice.ScriptVoicer(Crash(), workdir).voice(lines, profiles, str(out), opts)
+    assert script_voice.generated_lines(workdir) == {1, 2}  # kept although the run stopped
+    assert script_voice.load_results(workdir, out) is None  # no finished run yet
+
+    lines, profiles = script_voice.read_script(dubbing.parse_srt(SCRIPT))
+    script_voice.ScriptVoicer(_StubModel(), workdir).regenerate(lines, profiles, str(out), [3, 4], opts)
+    loaded = script_voice.load_results(workdir, out)
+    assert loaded is not None and [r["index"] for r in loaded.report] == [1, 2, 3, 4]
+    assert Path(loaded.audio_path).exists() and set(loaded.voices) == {"Dara", "Srey", "Narrator"}
