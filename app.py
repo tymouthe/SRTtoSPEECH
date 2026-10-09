@@ -126,6 +126,7 @@ _I18N_TRANSLATIONS = {
         "random_seed_info": "Generate a new seed before each inference run.",
         "tab_tts": "🗣️ Text to Speech",
         "tab_srt": "📝 SRT → Speech",
+        "tab_editor": "🎬 Video Editor",
         "usage_instructions": _USAGE_INSTRUCTIONS_EN,
         "examples_footer": _EXAMPLES_FOOTER_EN,
     },
@@ -151,6 +152,7 @@ _I18N_TRANSLATIONS = {
         "dit_steps_info": "LocDiT 流匹配生成迭代步数 — 步数越多 → 可能生成更好的音频质量，但速度变慢",
         "tab_tts": "🗣️ 语音合成",
         "tab_srt": "📝 字幕配音",
+        "tab_editor": "🎬 视频编辑",
         "usage_instructions": _USAGE_INSTRUCTIONS_ZH,
         "examples_footer": _EXAMPLES_FOOTER_ZH,
     },
@@ -383,8 +385,11 @@ _SRT_INSTRUCTIONS = (
     "`female`, or `boy` / `girl`), age (`adult` / `kid`) and emotion (`happy`, `sad`, `angry`, `fearful`, `surprised`, "
     "… or any word) are optional and in any order; gender and age only need to be given once per speaker. "
     "Untagged lines are read by *Narrator*.\n"
-    "2. Click **Analyze** — missing emotions are guessed from punctuation (and English keywords). Check and edit the "
-    "tables; download the fully tagged SRT to keep your edits.\n"
+    "   Optionally add the **original video** too: each line's tone (louder, softer, faster, …) is then read from the "
+    "original speech at its SRT time (and, if you tick it, a rough emotion for lines with none in their tag).\n"
+    "2. Click **Analyze** — missing emotions are guessed from punctuation (and English keywords), or read from the "
+    "video if you ticked that (an emotion written in a tag always wins). Check and edit the tables; download the fully "
+    "tagged SRT to keep your edits.\n"
     "3. Click **Generate** — each speaker's voice is made once as a **calm, neutral reading of their first line** "
     "(retried until its pitch fits their gender and age, e.g. a kid's). **Every line of that speaker — the first one "
     "too — clones that voice** and adds its own emotion, retried until it is consistent. You get one combined track "
@@ -398,7 +403,21 @@ _SRT_INSTRUCTIONS = (
     "every line already generated, and a generation in progress keeps running in the background."
 )
 _SRT_SPEAKER_HEADERS = ["Speaker", "Gender", "Age", "Voice description", "Lines"]
-_SRT_LINE_HEADERS = ["#", "Start", "End", "Speaker", "Emotion", "Text"]
+# Tone (louder, softer, faster, … read from the original video) is last, so projects saved before it still load.
+_SRT_LINE_HEADERS = ["#", "Start", "End", "Speaker", "Emotion", "Text", "Tone"]
+_EMOTION_MARKS = ("(guessed)", "(from video)")
+
+
+def _plain_emotion(value) -> str:
+    text = str(value or "")
+    for mark in _EMOTION_MARKS:
+        text = text.replace(mark, "")
+    return text.strip()
+
+
+def _line_rows_7(rows) -> list:
+    """Lines table rows with the Tone column (rows saved before it have 6 columns)."""
+    return [(list(r) + [""] * 7)[:7] for r in rows or []]
 _SRT_REPORT_HEADERS = [
     "#", "Speaker", "Gender", "Age", "Emotion", "Mode", "Voice match", "Pitch (Hz)", "Status", "Tries", "Slot (s)",
     "Generated (s)", "Text",
@@ -434,19 +453,41 @@ def _srt_current_project() -> Optional[str]:
     return workdir if Path(workdir, "tables.json").exists() else None
 
 
-def _srt_save_tables(workdir: str, speaker_rows, line_rows, tagged: Optional[str] = None) -> None:
+def _srt_save_tables(
+    workdir: str, speaker_rows, line_rows, tagged: Optional[str] = None, options: Optional[list] = None,
+    bump: bool = False,
+) -> None:
+    """Save the project tables. ``bump`` marks a change made outside the SRT tab (the video editor), so the
+    SRT tab reloads them when it is opened again."""
     path = Path(workdir, "tables.json")
     data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     data["speakers"] = [list(r) for r in _table_rows(speaker_rows)]
     data["lines"] = [list(r) for r in _table_rows(line_rows)]
     if tagged:
         data["tagged"] = tagged
+    if options is not None:
+        data["options"] = list(options)
+    if bump:
+        data["rev"] = int(data.get("rev", 0)) + 1
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     SRT_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     (SRT_PROJECTS_DIR / "current.json").write_text(json.dumps({"workdir": workdir}), encoding="utf-8")
 
 
-def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
+def _srt_tables_rev(workdir: Optional[str]) -> int:
+    try:
+        return int(json.loads(Path(workdir, "tables.json").read_text(encoding="utf-8")).get("rev", 0))
+    except (OSError, ValueError, TypeError):
+        return -1
+
+
+# Generation settings of the SRT tab, in order (the video editor reuses the last ones used there).
+_SRT_DEFAULT_OPTIONS = [True, 8, 1.1, False, True, 0.2, 2.0, 10]
+
+
+def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
+    """The SRT → Speech tab. Returns what the video editor tab needs: ``start_job(workdir, speaker_rows,
+    line_rows, options, only, new_voices)`` to regenerate lines, and the hand-over between the two tabs."""
     import shutil
 
     from voxcpm import dubbing, script_voice
@@ -454,7 +495,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
     speaker_models = {}
     no_change = gr.update()
 
-    def _analyze(srt_path, guess_emotion):
+    def _analyze(srt_path, guess_emotion, video_path=None, isolate=False, video_emotion=False, progress=gr.Progress()):
         if not srt_path:
             raise gr.Error("Please upload an SRT file first.")
         try:
@@ -471,16 +512,68 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
         Path(workdir).mkdir(parents=True, exist_ok=True)
         tagged = os.path.join(workdir, Path(srt_path).stem + "_tagged.srt")
         Path(tagged).write_text(script_voice.format_tagged_srt(lines, profiles), encoding="utf-8")
+        notes = list(problems)
+        video_note = ""
+        if video_path:
+            try:
+                used, music = _video_tones(workdir, lines, video_path, bool(isolate), bool(video_emotion), progress)
+                video_note = (
+                    f"🎬 Tone read from the video for **{used} of {len(lines)} lines**"
+                    + (f" ({len(lines) - used} had no speech in the video at their time)" if used < len(lines) else "")
+                    + ("; detected emotions are marked *(from video)*" if video_emotion else "")
+                    + ". The video is also ready in the 🎬 Video Editor tab."
+                    + (f"\n\n🎵 **{music} line(s) have music under the speech**, which the emotion model hears as anger, "
+                       "so their emotion was not taken from the video (they keep the guess). Tick **Separate the voices "
+                       "from the music first** and Analyze again to read those too." if music else "")
+                    + "\n\n"
+                )
+                Path(tagged).write_text(script_voice.format_tagged_srt(lines, profiles), encoding="utf-8")
+            except Exception as e:
+                logger.exception("Reading the tone from the video failed")
+                notes.append(f"The tone could not be read from the video: {e}")
         speaker_rows = script_voice.speaker_summary(lines, profiles)
         line_rows = [
             [
                 l.index, round(l.start, 3), round(l.end, 3), l.speaker,
-                l.emotion + (" (guessed)" if l.features.get("emotion_guessed") else ""), l.text,
+                l.emotion + (" (guessed)" if l.features.get("emotion_guessed") else "")
+                + (" (from video)" if l.features.get("emotion_from_video") else ""),
+                l.text, l.tone,
             ]
             for l in lines
         ]
         _srt_save_tables(workdir, speaker_rows, line_rows, tagged)
-        return speaker_rows, line_rows, tagged, workdir, _notes(problems)
+        return speaker_rows, line_rows, tagged, workdir, video_note + _notes(notes)
+
+    def _video_tones(workdir, lines, video_path, isolate, read_emotion, progress):
+        """Store the video in the project (the video editor uses it too) and read each line's emotion and tone
+        from the original speech at its SRT time. Returns (lines with a reading, lines whose emotion was skipped
+        because of music under the speech)."""
+        import soundfile as sf
+
+        from voxcpm import video_editor
+
+        progress(0.1, desc="Reading the video" + (" and separating the voices from the music (a few minutes)…" if isolate else "…"))
+        video_dir = Path(workdir, "video")
+        info = video_editor.prepare_video(video_path, video_dir, isolate_voices=isolate)
+        state = video_editor.load_state(workdir)
+        state["video"] = info
+        video_editor.save_state(workdir, state)
+        if not info.get("has_audio", True):
+            raise ValueError("the video has no sound")
+        source = video_dir / "audio16k.wav"
+        if info.get("isolated"):
+            source = video_dir / "voices16k.wav"  # the separated voices: no music in the measurements
+            dubbing.extract_audio(str(video_dir / "voices.wav"), str(source), dubbing.ANALYSIS_SR)
+        audio, sr = sf.read(str(source), dtype="float32")
+        progress(0.6, desc="Hearing each line's " + ("emotion and tone…" if read_emotion else "tone…"))
+        if read_emotion and "emotion" not in speaker_models:
+            speaker_models["emotion"] = dubbing.load_emotion_model()
+        tones = script_voice.tones_from_audio(
+            lines, audio, sr, video_dir / "line_clips", regions=info.get("regions"),
+            emotion_model=speaker_models.get("emotion"), music_removed=bool(info.get("isolated")),
+            read_emotion=read_emotion,
+        )
+        return script_voice.apply_tones(lines, tones), sum(1 for t in tones.values() if t.get("music"))
 
     def _read_tables(speaker_rows, line_rows):
         profiles = {}
@@ -501,7 +594,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
             )
         lines = []
         for row in _table_rows(line_rows):
-            idx, start, end, speaker, emotion, text = (list(row) + [""] * 6)[:6]
+            idx, start, end, speaker, emotion, text, tone = (list(row) + [""] * 7)[:7]
             if not str(text).strip():
                 continue
             speaker = str(speaker).strip() or script_voice.DEFAULT_SPEAKER
@@ -513,7 +606,8 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
                     text=str(text).strip(),
                     speaker=speaker,
                     gender=profiles[speaker].gender if speaker in profiles else "unknown",
-                    emotion=str(emotion or "").replace("(guessed)", "").strip() or "neutral",
+                    emotion=_plain_emotion(emotion) or "neutral",
+                    tone=str(tone or "").strip(),
                 )
             )
         if not lines:
@@ -568,6 +662,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
             gr.update(choices=speakers, value=voice_speaker),
             result.voices,
             result.voices.get(voice_speaker) if voice_speaker else None,
+            gr.update(visible=True),
         )
 
     def _partial_outputs(workdir, line_rows, notes, tagged=None):
@@ -588,6 +683,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
             no_change,
             no_change,
             no_change,
+            gr.update(visible=bool(line_files)),
         )
 
     def _job_worker(job, workdir, lines, profiles, options, only, new_voices, verify_voice):
@@ -626,6 +722,20 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
     ):
         if not workdir:
             raise gr.Error("Please upload an SRT and click Analyze first.")
+        job = _start_job(
+            workdir, speaker_rows, line_rows,
+            [verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence, max_pause, cfg_value, dit_steps],
+            only, new_voices,
+        )
+        # Follow the job; if the tab is closed it simply carries on in the background.
+        while job["status"] == "running":
+            progress(job["i"] / max(job["n"], 1), desc=job["desc"] or "Starting...")
+            time.sleep(0.5)
+        return _finished(job, workdir, line_rows)
+
+    def _start_job(workdir, speaker_rows, line_rows, settings, only=None, new_voices=()):
+        """Start a generation in the background (raises gr.Error if the tables are wrong or a run is going)."""
+        verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence, max_pause, cfg_value, dit_steps = settings
         try:
             lines, profiles = _read_tables(speaker_rows, line_rows)
         except Exception as e:
@@ -653,17 +763,13 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
             job = {"status": "running", "i": 0, "n": len(lines), "desc": "", "error": None, "result": None,
                    "only": only, "new_voices": set(new_voices)}
             _SRT_JOBS[workdir] = job
-        _srt_save_tables(workdir, speaker_rows, line_rows)
+        _srt_save_tables(workdir, speaker_rows, line_rows, options=list(settings))
         threading.Thread(
             target=_job_worker,
             args=(job, workdir, lines, profiles, options, only, set(new_voices), bool(verify_voice)),
             daemon=True,
         ).start()
-        # Follow the job; if the tab is closed it simply carries on in the background.
-        while job["status"] == "running":
-            progress(job["i"] / max(job["n"], 1), desc=job["desc"] or "Starting...")
-            time.sleep(0.5)
-        return _finished(job, workdir, line_rows)
+        return job
 
     def _finished(job, workdir, line_rows):
         if job["status"] == "failed":
@@ -715,12 +821,12 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
 
     def _restore():
         """Bring a reopened (or reloaded) page back to the last project: tables, generated lines and any run in progress."""
-        nothing = (no_change,) * 3 + (no_change,) * 12 + (gr.Timer(active=False),)
+        nothing = (no_change,) * 3 + (no_change,) * 13 + (gr.Timer(active=False),)
         workdir = _srt_current_project()
         if not workdir:
             return nothing
         tables = json.loads(Path(workdir, "tables.json").read_text(encoding="utf-8"))
-        speaker_rows, line_rows = tables.get("speakers", []), tables.get("lines", [])
+        speaker_rows, line_rows = tables.get("speakers", []), _line_rows_7(tables.get("lines", []))
         tagged = tables.get("tagged")
         head = (speaker_rows, line_rows, workdir)
         job = _SRT_JOBS.get(workdir)
@@ -746,11 +852,11 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
         """While a background run goes on, update its progress; when it ends, show its results once."""
         job = _SRT_JOBS.get(workdir) if workdir else None
         if not job:
-            return (no_change,) * 12 + (gr.Timer(active=False),)
+            return (no_change,) * 13 + (gr.Timer(active=False),)
         if job["status"] == "running":
             return _partial_outputs(workdir, line_rows, _job_note(job)) + (gr.Timer(active=True),)
         if job["status"] == "failed":
-            return (no_change,) * 7 + (f"⚠️ The run stopped with an error: {job['error']}",) + (no_change,) * 4 + (
+            return (no_change,) * 7 + (f"⚠️ The run stopped with an error: {job['error']}",) + (no_change,) * 5 + (
                 gr.Timer(active=False),
             )
         return _finished(job, workdir, line_rows) + (gr.Timer(active=False),)
@@ -762,6 +868,24 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
     with gr.Row():
         with gr.Column():
             srt_input = gr.File(label="📝 Tagged subtitles (.srt)", file_types=[".srt"], type="filepath")
+            video_input = gr.File(
+                label="🎬 Original video (optional) — each line's emotion and tone are read from its speech",
+                file_types=["video", "audio", ".mkv", ".avi", ".mov", ".mp4", ".webm", ".wav", ".mp3", ".m4a"],
+                type="filepath",
+            )
+            video_emotion_input = gr.Checkbox(
+                value=False,
+                label="Also take each line's emotion from the video (rough)",
+                info="Off: only the tone (louder, softer, faster, …) is read. On: lines with no emotion in their tag also get "
+                "one from the video — a rough guess (any tense, raised voice is heard as angry)",
+                elem_classes=["switch-toggle"],
+            )
+            isolate_input = gr.Checkbox(
+                value=False,
+                label="Separate the voices from the music first",
+                info="Slower (a few minutes, and a one-time download), much more accurate when there is music under the speech",
+                elem_classes=["switch-toggle"],
+            )
             guess_emotion = gr.Checkbox(
                 value=True,
                 label="Guess missing emotions",
@@ -772,6 +896,9 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
             tagged_output = gr.File(label="Tagged SRT (every line with speaker, gender, age and emotion)")
         with gr.Column():
             audio_output = gr.Audio(label="Combined track (on the SRT timing)", type="filepath")
+            editor_btn = gr.Button(
+                "🎬 Next: place the vocals on your video (Video Editor) →", variant="primary", visible=False
+            )
 
     with gr.Row():
         with gr.Column():
@@ -792,8 +919,9 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
     )
     lines_table = gr.Dataframe(
         headers=_SRT_LINE_HEADERS,
-        datatype=["number", "number", "number", "str", "str", "str"],
-        label="💬 Lines — edit speaker or emotion (happy, sad, angry, fearful, surprised, … or any word)",
+        datatype=["number", "number", "number", "str", "str", "str", "str"],
+        label="💬 Lines — edit speaker, emotion (happy, sad, angry, fearful, surprised, … or any word) or tone "
+        "(how it is said, e.g. louder and more forceful, speaking faster)",
         interactive=True,
         wrap=True,
         max_height=420,
@@ -852,7 +980,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
 
     analyze_btn.click(
         fn=_analyze,
-        inputs=[srt_input, guess_emotion],
+        inputs=[srt_input, guess_emotion, video_input, isolate_input, video_emotion_input],
         outputs=[speakers_table, lines_table, tagged_output, workdir_state, notes_box],
     )
     settings = [
@@ -861,7 +989,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
     ]
     results = [
         audio_output, zip_output, line_files_output, line_picker, line_player, tagged_output, report_table, notes_box,
-        retry_picker, revoice_picker, voices_state, voice_preview,
+        retry_picker, revoice_picker, voices_state, voice_preview, editor_btn,
     ]
     generate_btn.click(fn=_generate, inputs=settings, outputs=results, api_name="voice_srt")
     retry_btn.click(fn=_regenerate, inputs=[retry_picker] + settings, outputs=results, api_name="regenerate_srt_lines")
@@ -870,12 +998,403 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks):
     revoice_picker.change(
         fn=lambda name, voices: (voices or {}).get(name), inputs=[revoice_picker, voices_state], outputs=voice_preview
     )
-    blocks.load(
-        fn=_restore,
-        outputs=[speakers_table, lines_table, workdir_state] + results + [poll_timer],
-        api_name="restore_srt",
-    )
+    seen_rev = gr.State(-1)
+
+    def _restore_with_rev():
+        workdir = _srt_current_project()
+        return _restore() + (_srt_tables_rev(workdir) if workdir else -1,)
+
+    def _reopen(rev):
+        """Back on this tab: reload the project if the video editor changed it (edited or regenerated lines)."""
+        workdir = _srt_current_project()
+        current = _srt_tables_rev(workdir) if workdir else -1
+        if current == rev and not (workdir and _SRT_JOBS.get(workdir, {}).get("status") == "running"):
+            return (no_change,) * 3 + (no_change,) * 13 + (no_change, no_change)
+        return _restore_with_rev()
+
+    restore_outputs = [speakers_table, lines_table, workdir_state] + results + [poll_timer, seen_rev]
+    blocks.load(fn=_restore_with_rev, outputs=restore_outputs, api_name="restore_srt")
     poll_timer.tick(fn=_poll, inputs=[workdir_state, lines_table], outputs=results + [poll_timer])
+
+    def _leave(workdir, speaker_rows, line_rows):
+        """Save the tables (with any edits not yet generated) so the video editor sees them."""
+        if workdir and Path(workdir, "tables.json").exists():
+            _srt_save_tables(workdir, speaker_rows, line_rows)
+
+    return {
+        "editor_btn": editor_btn,
+        "leave": _leave,
+        "start_job": _start_job,
+        "reopen": _reopen,
+        "reopen_inputs": [seen_rev],
+        "reopen_outputs": restore_outputs,
+        "enter_inputs": [workdir_state, speakers_table, lines_table],
+    }
+
+
+# ---------- Video Editor tab ----------
+
+_EDITOR_ASSETS = Path(__file__).resolve().parent / "assets" / "video_editor"
+
+
+def _file_url(path: str, version=None) -> str:
+    return f"/gradio_api/file={path}" + (f"?v={version}" if version is not None else "")
+
+
+def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
+    """A small video editor for the SRT → Speech project: the generated lines as clips on a timeline over the
+    video, lined up with the speech found in the video; move, trim, mute, regenerate and export."""
+    import shutil
+
+    import soundfile as sf
+
+    from gradio.utils import get_upload_folder
+
+    from voxcpm import script_voice, video_editor
+
+    def _project():
+        workdir = _srt_current_project()
+        if not workdir:
+            raise ValueError("No SRT → Speech project yet — analyze and generate an SRT first.")
+        return workdir
+
+    def _tables(workdir):
+        return json.loads(Path(workdir, "tables.json").read_text(encoding="utf-8"))
+
+    def _job(workdir):
+        job = _SRT_JOBS.get(workdir)
+        if not job:
+            return None
+        return {k: job.get(k) for k in ("status", "i", "n", "desc", "error")} | {
+            "only": sorted(job.get("only") or []), "new_voices": sorted(job.get("new_voices") or []),
+        }
+
+    def _payload(workdir):
+        tables = _tables(workdir)
+        state = video_editor.load_state(workdir)
+        script_state_path = Path(workdir, "script_state.json")
+        script_state = json.loads(script_state_path.read_text(encoding="utf-8")) if script_state_path.exists() else {}
+        entries, rounds = script_state.get("entries", {}), script_state.get("rounds", {})
+        report_path = Path(workdir, "report.json")
+        placed = {}
+        if report_path.exists():
+            for r in json.loads(report_path.read_text(encoding="utf-8")):
+                placed[int(r["index"])] = float(r["start"]) + float(r.get("shift_s") or 0)
+        lines, changed = [], False
+        placed_lines = {video_editor.clip_line(k, c) for k, c in state["clips"].items()}
+        for row in _table_rows(tables.get("lines", [])):
+            idx, start, end, speaker, emotion, text, tone = (list(row) + [""] * 7)[:7]
+            try:
+                index = int(float(idx))
+            except (TypeError, ValueError):
+                continue
+            start, end = float(start or 0), float(end or 0)
+            raw = Path(workdir, "raw", f"{index:04d}.wav")
+            entry = entries.get(str(index))
+            line = {
+                "index": index, "start": start, "end": end, "speaker": str(speaker or script_voice.DEFAULT_SPEAKER),
+                "emotion": _plain_emotion(emotion), "text": str(text), "tone": str(tone or ""),
+                "url": None, "duration": 0.0, "status": "⏳ not generated", "ok": False,
+            }
+            if entry and raw.exists():
+                line.update(
+                    url=_file_url(str(raw), f"{rounds.get(str(index), 0)}-{int(raw.stat().st_mtime)}"),
+                    duration=round(sf.info(str(raw)).duration, 3),
+                    status=_line_status(entry),
+                    ok=_line_status(entry).startswith("✅"),
+                )
+            if index not in placed_lines:
+                state["clips"][str(index)] = video_editor.default_clip(placed.get(index, start))
+                changed = True
+            lines.append(line)
+        if changed:
+            video_editor.save_state(workdir, state)
+        video = state.get("video")
+        if video and not Path(video.get("preview", "")).exists():
+            video = None
+        if video and not (state["mix"].get("subs") or {}).get("box"):
+            # Subtitles found in the picture are filled in by default; the editor shows (and moves) the area.
+            box = video.get("subtitle_box")
+            state["mix"]["subs"] = {"mode": "fill" if box else "off", "box": box or [0.1, 0.75, 0.8, 0.07]}
+        if video:
+            video = dict(video, url=_file_url(video["preview"]))
+            if video.get("music") and Path(video["music"]).exists():
+                video["music_url"] = _file_url(video["music"])
+        return {
+            "workdir": workdir,
+            "project": Path(workdir).name,
+            "lines": lines,
+            "speakers": [str(r[0]) for r in _table_rows(tables.get("speakers", []))],
+            "clips": state["clips"],
+            "mix": state["mix"],
+            "tracks": state.get("tracks", {}),
+            "subtitles": state.get("subtitles"),
+            "video": video,
+            "job": _job(workdir),
+        }
+
+    def _safe(fn):
+        """Server functions answer {"error": ...} instead of failing, so the editor can show the message."""
+
+        def wrapper(arg=None):
+            try:
+                return fn(arg if isinstance(arg, dict) else {})
+            except gr.Error as e:
+                return {"error": e.message}
+            except Exception as e:
+                logger.exception("Video editor: %s failed", fn.__name__)
+                return {"error": str(e)}
+
+        wrapper.__name__ = fn.__name__
+        return wrapper
+
+    @_safe
+    def editor_load(arg):
+        workdir = _project()
+        state = video_editor.load_state(workdir)
+        # Videos added before burned-in subtitles were looked for get looked at now (once).
+        if state.get("video") and video_editor.ensure_subtitle_box(state["video"]):
+            video_editor.save_state(workdir, state)
+        return _payload(workdir)
+
+    @_safe
+    def editor_find_subtitles(arg):
+        workdir = _project()
+        state = video_editor.load_state(workdir)
+        if not state.get("video"):
+            raise ValueError("Add a video first.")
+        state["video"].pop("subtitle_box", None)
+        video_editor.ensure_subtitle_box(state["video"])
+        box = state["video"].get("subtitle_box")
+        if box:
+            state["mix"]["subs"] = {"mode": (state["mix"].get("subs") or {}).get("mode", "fill"), "box": box}
+        video_editor.save_state(workdir, state)
+        return _payload(workdir) | {"found": bool(box)}
+
+    @_safe
+    def editor_video(arg):
+        workdir = _project()
+        path = Path(str(arg.get("path") or "")).resolve()
+        if not path.is_file() or Path(get_upload_folder()).resolve() not in path.parents:
+            raise ValueError("The video upload did not arrive — please try again.")
+        if not video_editor.has_ffmpeg():
+            raise ValueError("ffmpeg is needed for the video editor — install it (e.g. `brew install ffmpeg`).")
+        info = video_editor.prepare_video(str(path), Path(workdir, "video"), isolate_voices=bool(arg.get("isolate")))
+        state = video_editor.load_state(workdir)
+        state["video"] = info
+        video_editor.save_state(workdir, state)
+        return _payload(workdir)
+
+    @_safe
+    def editor_detect(arg):
+        workdir = _project()
+        state = video_editor.load_state(workdir)
+        info = state.get("video")
+        if not info:
+            raise ValueError("Add a video first.")
+        sensitivity = float(arg.get("sensitivity", 0.5))
+        if arg.get("isolate") and not info.get("isolated"):
+            info.update(video_editor.isolate_and_detect(info, Path(workdir, "video"), sensitivity))
+        else:
+            info["regions"] = video_editor.redetect(info, Path(workdir, "video"), sensitivity)
+        info["sensitivity"] = sensitivity
+        video_editor.save_state(workdir, state)
+        return _payload(workdir)
+
+    @_safe
+    def editor_speed(arg):
+        """The line's audio at another speed, pitch kept (what the editor plays for a sped-up / slowed clip)."""
+        workdir = _project()
+        line = int(arg.get("line"))
+        raw = Path(workdir, "raw", f"{line:04d}.wav")
+        if not raw.exists():
+            raise ValueError(f"Line #{line} has not been generated yet.")
+        out = video_editor.stretched_file(raw, float(arg.get("speed") or 1), Path(workdir, "stretched"))
+        return {"url": _file_url(str(out))}
+
+    @_safe
+    def editor_save(arg):
+        workdir = _project()
+        state = video_editor.load_state(workdir)
+        for key in ("clips", "mix", "tracks", "subtitles"):
+            if isinstance(arg.get(key), dict):
+                state[key] = arg[key]
+        video_editor.save_state(workdir, state)
+        return {"ok": True}
+
+    def _apply_line_edits(workdir, edits):
+        """Write text / emotion / speaker changes made in the editor into the project tables."""
+        if not edits:
+            return
+        tables = _tables(workdir)
+        rows = _line_rows_7(_table_rows(tables.get("lines", [])))
+        by_index = {int(e["index"]): e for e in edits}
+        known = {str(r[0]) for r in _table_rows(tables.get("speakers", []))}
+        for row in rows:
+            edit = by_index.get(int(float(row[0])))
+            if not edit:
+                continue
+            if edit.get("speaker") is not None:
+                if str(edit["speaker"]) not in known:
+                    raise ValueError(f"Unknown speaker {edit['speaker']!r}.")
+                row[3] = str(edit["speaker"])
+            if edit.get("emotion") is not None:
+                row[4] = str(edit["emotion"]).strip() or "neutral"
+            if edit.get("tone") is not None:
+                row[6] = str(edit["tone"]).strip()
+            if edit.get("text") is not None and str(edit["text"]).strip():
+                row[5] = str(edit["text"]).strip()
+        _srt_save_tables(workdir, tables.get("speakers", []), rows, bump=True)
+
+    @_safe
+    def editor_edit_lines(arg):
+        workdir = _project()
+        _apply_line_edits(workdir, arg.get("edits") or [])
+        return _payload(workdir)
+
+    @_safe
+    def editor_regenerate(arg):
+        workdir = _project()
+        _apply_line_edits(workdir, arg.get("edits") or [])
+        tables = _tables(workdir)
+        options = (list(tables.get("options") or []) + _SRT_DEFAULT_OPTIONS[len(tables.get("options") or []):])[:8]
+        if arg.get("new_voice"):
+            redo = {int(float(r[0])) for r in _table_rows(tables["lines"]) if str(r[3]) == str(arg["new_voice"])}
+            srt["start_job"](workdir, tables["speakers"], tables["lines"], options, only=(),
+                             new_voices={str(arg["new_voice"])})
+        else:
+            redo = {int(i) for i in arg.get("indices") or []}
+            if not redo:
+                raise ValueError("Select the clip(s) to regenerate first.")
+            srt["start_job"](workdir, tables["speakers"], tables["lines"], options, only=redo)
+        # A regenerated line gets new audio, so a line that was cut into pieces becomes one clip again.
+        state = video_editor.load_state(workdir)
+        state["clips"] = video_editor.collapse_pieces(state["clips"], redo)
+        video_editor.save_state(workdir, state)
+        # The SRT tab shows the new results when it is opened again.
+        _srt_save_tables(workdir, tables["speakers"], tables["lines"], bump=True)
+        return {"job": _job(workdir)}
+
+    @_safe
+    def editor_status(arg):
+        workdir = _project()
+        job = _job(workdir)
+        if job and job["status"] != "running":
+            return _payload(workdir)
+        return {"job": job}
+
+    def _subtitle_images(folder: Path, items: list) -> list:
+        """The subtitle images drawn by the editor (base64 PNG) as files, with when and where to show them."""
+        import base64
+
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True)
+        overlays = []
+        for i, item in enumerate(items):
+            png = base64.b64decode(str(item.get("png") or ""), validate=True)
+            if not png.startswith(b"\x89PNG"):
+                raise ValueError("A subtitle image is not a PNG.")
+            path = folder / f"{i:04d}.png"
+            path.write_bytes(png)
+            overlays.append((float(item["start"]), float(item["end"]), int(item.get("x") or 0), int(item.get("y") or 0), str(path)))
+        return overlays
+
+    @_safe
+    def editor_export(arg):
+        workdir = _project()
+        state = video_editor.load_state(workdir)
+        for key in ("clips", "mix", "tracks", "subtitles"):
+            if isinstance(arg.get(key), dict):
+                state[key] = arg[key]
+        video_editor.save_state(workdir, state)
+        info = state.get("video")
+        if not info:
+            raise ValueError("Add a video first.")
+        mix = state["mix"]
+        # The original sound switched off (🔇 in the editor) leaves it out whatever mode is chosen.
+        mode = mix.get("original", "duck") if mix.get("original_on", True) else "mute"
+        muted_tracks = {name for name, t in (state.get("tracks") or {}).items() if t.get("muted")}
+        tables = _tables(workdir)
+        speakers = {int(float(r[0])): str(r[3]) for r in _table_rows(tables.get("lines", []))}
+        clips, sr, audio = [], None, {}
+        for key, clip in state["clips"].items():
+            line = video_editor.clip_line(key, clip)
+            raw = Path(workdir, "raw", f"{line:04d}.wav")
+            if not raw.exists() or line not in speakers:
+                continue
+            if line not in audio:  # a line cut into pieces is read once
+                audio[line], rate = sf.read(str(raw), dtype="float32")
+                sr = sr or rate
+            if speakers[line] in muted_tracks:
+                clip = dict(clip, muted=True)
+            clips.append((clip, audio[line]))
+        if not clips:
+            raise ValueError("No generated lines to place on the video yet.")
+        out_dir = Path(workdir, "export")
+        out_dir.mkdir(exist_ok=True)
+        original = None
+        if mode != "mute" and info.get("has_audio", True):
+            if mode == "music":
+                if not (info.get("music") and Path(info["music"]).exists()):
+                    info.update(video_editor.isolate_and_detect(info, Path(workdir, "video")))
+                    video_editor.save_state(workdir, state)
+                original = video_editor.read_soundtrack(info["music"], sr, out_dir / "original.wav")
+            else:
+                original = video_editor.read_soundtrack(info["source"], sr, out_dir / "original.wav")
+        total = float(info["duration"])
+        stem = re.sub(r"[^\w\-]+", "_", Path(info.get("name") or "video").stem)[:40] or "video"
+        level = bool(mix.get("level", True))  # "Level voices": every clip at the same loudness
+        vocals = video_editor.render_mix(
+            clips, total, sr, None, "mute", vocals_gain_db=float(mix.get("vocals_gain_db", 0)), level=level
+        )
+        vocals_path = out_dir / f"{stem}_vocals.wav"
+        sf.write(str(vocals_path), vocals, sr)
+        mixed = video_editor.render_mix(
+            clips, total, sr, original, mode,
+            original_gain_db=float(mix.get("original_gain_db", 0)), vocals_gain_db=float(mix.get("vocals_gain_db", 0)),
+            regions=info.get("regions") or [], level=level,
+        )
+        mix_path = out_dir / f"{stem}_soundtrack.wav"
+        sf.write(str(mix_path), mixed, sr)
+        version = int(time.time())
+        result = {}
+        if info.get("has_video", True):
+            video_path = out_dir / f"{stem}_dubbed{video_editor.export_extension(info['source'])}"
+            video_editor.export_video(
+                info["source"], str(mix_path), video_path, subtitles=mix.get("subs"),
+                overlays=_subtitle_images(out_dir / "subtitles", arg.get("overlays") or []),
+            )
+            result = {"video_url": _file_url(str(video_path), version), "video_name": video_path.name}
+        # An audio file (no picture) exports as the soundtrack only.
+        return result | {
+            "vocals_url": _file_url(str(vocals_path), version), "vocals_name": vocals_path.name,
+            "soundtrack_url": _file_url(str(mix_path), version), "soundtrack_name": mix_path.name,
+        }
+
+    # The editor itself runs in the browser (assets/video_editor) and calls the functions above.
+    editor_html = gr.HTML(
+        value=json.dumps({"open": 0}),
+        html_template=(_EDITOR_ASSETS / "editor.html").read_text(encoding="utf-8"),
+        js_on_load=(_EDITOR_ASSETS / "editor.js").read_text(encoding="utf-8"),
+        apply_default_css=False,
+        elem_id="video-editor",
+        server_functions=[
+            editor_load, editor_video, editor_detect, editor_save, editor_edit_lines, editor_regenerate,
+            editor_status, editor_export, editor_speed, editor_find_subtitles,
+        ],
+    )
+
+    def _enter(workdir, speaker_rows, line_rows):
+        srt["leave"](workdir, speaker_rows, line_rows)
+        return json.dumps({"open": time.time()})
+
+    def _open_from_srt(workdir, speaker_rows, line_rows):
+        return gr.Tabs(selected="editor"), _enter(workdir, speaker_rows, line_rows)
+
+    srt["editor_btn"].click(
+        fn=_open_from_srt, inputs=srt["enter_inputs"], outputs=[tabs, editor_html], show_progress="hidden"
+    )
+    editor_tab.select(fn=_enter, inputs=srt["enter_inputs"], outputs=editor_html, show_progress="hidden")
 
 
 # ---------- UI ----------
@@ -957,8 +1476,8 @@ def create_demo_interface(demo: VoxCPMDemo):
             "</div>"
         )
 
-        with gr.Tabs():
-            with gr.Tab(I18N("tab_tts")):
+        with gr.Tabs() as tabs:
+            with gr.Tab(I18N("tab_tts"), id="tts"):
                 gr.Markdown(I18N("usage_instructions"))
 
                 with gr.Row():
@@ -1083,8 +1602,14 @@ def create_demo_interface(demo: VoxCPMDemo):
                     api_name="generate",
                 )
 
-            with gr.Tab(I18N("tab_srt")):
-                build_srt_tab(demo, interface)
+            with gr.Tab(I18N("tab_srt"), id="srt") as srt_tab:
+                srt = build_srt_tab(demo, interface)
+            with gr.Tab(I18N("tab_editor"), id="editor") as editor_tab:
+                build_editor_tab(tabs, editor_tab, srt)
+        # Back on the SRT tab after editing in the video editor: show the edited / regenerated lines.
+        srt_tab.select(
+            fn=srt["reopen"], inputs=srt["reopen_inputs"], outputs=srt["reopen_outputs"], show_progress="hidden"
+        )
 
     return interface
 
@@ -1104,7 +1629,7 @@ def run_demo(
         show_error=show_error,
         i18n=I18N,
         theme=_APP_THEME,
-        css=_CUSTOM_CSS,
+        css=_CUSTOM_CSS + (_EDITOR_ASSETS / "editor.css").read_text(encoding="utf-8"),
         allowed_paths=[str(SRT_PROJECTS_DIR)],
     )
 

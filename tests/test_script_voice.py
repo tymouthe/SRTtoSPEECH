@@ -293,3 +293,69 @@ def test_progress_is_saved_per_line_and_results_can_be_reloaded(tmp_path):
     loaded = script_voice.load_results(workdir, out)
     assert loaded is not None and [r["index"] for r in loaded.report] == [1, 2, 3, 4]
     assert Path(loaded.audio_path).exists() and set(loaded.voices) == {"Dara", "Srey", "Narrator"}
+
+
+class _StubEmotionModel:
+    """Stands in for SenseVoice: every clip is "angry" except line 2's."""
+
+    def generate(self, input, **kwargs):
+        def text(p):
+            if p.endswith("0002.wav"):
+                return "<|zh|><|NEUTRAL|><|Speech|>"
+            if p.endswith("0004.wav"):
+                return "<|zh|><|ANGRY|><|BGM|>"  # music under the speech
+            return "<|zh|><|ANGRY|><|Speech|>"
+
+        return [{"key": Path(p).stem, "text": text(p)} for p in input]
+
+
+def test_tones_are_read_from_the_original_speech_at_each_line(tmp_path):
+    sr = 16_000
+    lines, profiles = script_voice.read_script(dubbing.parse_srt(
+        "1\n00:00:00,000 --> 00:00:02,000\n[Dara|male] one two three\n\n"
+        "2\n00:00:02,000 --> 00:00:04,000\n[Dara] four five six!\n\n"
+        "3\n00:00:04,000 --> 00:00:06,000\n[Dara|sad] seven eight nine\n\n"
+        "4\n00:00:06,000 --> 00:00:08,000\n[Dara] ten eleven twelve\n\n"
+        "5\n00:00:09,000 --> 00:00:10,000\n[Dara] nobody speaks here\n"
+    ))
+    audio = np.concatenate([
+        _tone(140, 2, sr) * 0.3, _tone(150, 2, sr) * 0.3, _tone(130, 2, sr) * 0.3, _tone(145, 2, sr) * 3.0,
+        np.zeros(sr * 2, dtype=np.float32),
+    ])
+    regions = [(0.0, 8.0)]
+    tones = script_voice.tones_from_audio(lines, audio, sr, tmp_path, regions=regions, emotion_model=_StubEmotionModel())
+    assert set(tones) == {1, 2, 3, 4}  # line 5 has no speech in the video
+    assert "louder" in tones[4]["tone"]
+    assert tones[1]["emotion"] == "angry"
+    assert tones[4]["music"] and tones[4]["emotion"] == ""  # music under it: its "anger" is not trusted
+    clean = script_voice.tones_from_audio(
+        lines, audio, sr, tmp_path, regions=regions, emotion_model=_StubEmotionModel(), music_removed=True
+    )
+    assert clean[4]["emotion"] == "angry"
+    tone_only = script_voice.tones_from_audio(lines, audio, sr, tmp_path, regions=regions, read_emotion=False)
+    assert tone_only[1]["emotion"] == "" and "louder" in tone_only[4]["tone"]  # no emotion model needed
+
+    assert script_voice.apply_tones(lines, tones) == 4
+    by_index = {l.index: l for l in lines}
+    assert by_index[1].emotion == "angry" and by_index[1].features.get("emotion_from_video")
+    assert by_index[2].emotion == "excited"  # the video heard "neutral": the guess from "!" stays
+    assert by_index[3].emotion == "sad"  # written in the tag: wins over the video
+    assert by_index[4].emotion == "neutral" and "louder" in by_index[4].tone  # tone kept, emotion not from music
+    assert "louder" in dubbing.line_style(by_index[4])  # what generation puts in the voice instruction
+
+
+def test_long_voice_tags_are_read_and_unclear_tags_are_reported(tmp_path):
+    srt = tmp_path / "s.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n[Chen Dayong|male|adult|indifferent] hello\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n[Chen Dayong|male|young_adult|mocking] hi\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\n[" + "x" * 90 + "] too long\n",
+        encoding="utf-8",
+    )
+    lines, profiles = script_voice.load_script(srt)
+    assert lines[0].speaker == "Chen Dayong" and lines[0].emotion == "indifferent"
+    assert profiles["Chen Dayong"].gender == "male"
+    problems = script_voice.find_srt_problems(srt)
+    assert len(problems) == 2
+    assert "young_adult|mocking" in problems[0] and "'mocking' is used as the emotion" in problems[0]
+    assert problems[1].startswith("Line 3:") and "could not be read" in problems[1]

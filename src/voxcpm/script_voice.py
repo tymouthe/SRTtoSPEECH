@@ -172,6 +172,7 @@ def read_script(lines: list[SubtitleLine], guess_missing_emotion: bool = True) -
         info["age"] = info["age"] or tag.age
         if tag.emotion:
             line.emotion = tag.emotion
+            line.features["emotion_tagged"] = True
         elif guess_missing_emotion:
             line.emotion = guess_emotion(line.text)
             line.features["emotion_guessed"] = True
@@ -197,7 +198,8 @@ _ARROW_TIME_RE = re.compile(r"^\s*\d+:\d{1,2}:\d{1,2}[,.]\d{1,3}\s*-->\s*\d+:\d{
 
 
 def find_srt_problems(path: str | os.PathLike) -> list[str]:
-    """Blocks of an SRT that would be skipped (no readable ``start --> end`` timing line), as messages."""
+    """Blocks of an SRT that would be skipped (no readable ``start --> end`` timing line), and voice tags that are
+    not read as meant (not recognised at all, or with more than one word that is not a gender or age), as messages."""
     raw = Path(path).read_bytes()
     for enc in ("utf-8-sig", "utf-16", "gb18030", "latin-1"):
         try:
@@ -209,7 +211,10 @@ def find_srt_problems(path: str | os.PathLike) -> list[str]:
     problems = []
     for block in re.split(r"\n\s*\n", content.strip()):
         rows = [r for r in block.split("\n") if r.strip()]
-        if not rows or any(_ARROW_TIME_RE.match(r) for r in rows):
+        if rows and any(_ARROW_TIME_RE.match(r) for r in rows):
+            problems.extend(_tag_problems(rows))
+            continue
+        if not rows:
             continue
         number = rows[0].strip() if rows[0].strip().isdigit() else "?"
         timing = next((r.strip() for r in rows if ":" in r and "," in r and not r.strip().startswith("[")), None)
@@ -221,6 +226,28 @@ def find_srt_problems(path: str | os.PathLike) -> list[str]:
             + (f" (text: {text[:40]}…)" if text else "")
         )
     return problems
+
+
+def _tag_problems(rows: list[str]) -> list[str]:
+    from .dubbing import split_speaker_tag
+
+    number = rows[0].strip() if rows[0].strip().isdigit() else "?"
+    text = " ".join(r.strip() for r in rows if r.strip() != number and not _ARROW_TIME_RE.match(r))
+    if not text.startswith(("[", "【")):
+        return []
+    name, _ = split_speaker_tag(text)
+    if name is None:
+        tag = text[: text.find("]") + 1] if "]" in text else text[:40]
+        return [f"Line {number}: its tag {tag} could not be read, so the line is read by {DEFAULT_SPEAKER}."]
+    parts = [p.strip() for p in re.split(r"[|/]", name) if p.strip()][1:]
+    known = set(_GENDER_WORDS) | set(_AGE_WORDS) | set(_KID_WORDS)
+    others = [p for p in parts if p.lower() not in known]
+    if len(others) > 1:
+        return [
+            f"Line {number}: '{'|'.join(others)}' — after the name only male/female, adult/kid and one emotion are "
+            f"understood, so '{others[-1]}' is used as the emotion and the rest is ignored."
+        ]
+    return []
 
 
 def format_tagged_srt(lines: list[SubtitleLine], profiles: dict[str, SpeakerProfile]) -> str:
@@ -238,6 +265,107 @@ def format_tagged_srt(lines: list[SubtitleLine], profiles: dict[str, SpeakerProf
             f"{i}\n{seconds_to_srt_time(line.start)} --> {seconds_to_srt_time(line.end)}\n[{'|'.join(parts)}] {line.text}\n"
         )
     return "\n".join(out)
+
+
+# -----------------------------
+# Tone from the original video
+# -----------------------------
+
+
+def tones_from_audio(
+    lines: list[SubtitleLine],
+    audio: np.ndarray,
+    sr: int,
+    clip_dir: str | os.PathLike,
+    regions: Optional[list] = None,
+    emotion_model=None,
+    music_removed: bool = False,
+    read_emotion: bool = True,
+) -> dict[int, dict]:
+    """Read each line's emotion and delivery from the original speech at its SRT time (``audio``: the video's
+    soundtrack, or its separated voices, mono). Returns ``{index: {"emotion", "tone"}}`` for the lines that have
+    speech there (with ``regions``, the speech found in the video, a line needs some of it under its time).
+
+    The emotion comes from SenseVoice; the tone ("louder and more forceful", "speaking faster", …) compares the
+    line with how that speaker usually sounds in the video (:func:`voxcpm.dubbing.describe_tone`).
+
+    SenseVoice hears music under speech as anger, so where it reports background music the emotion is left out
+    (``"music": True``) unless the voices were separated from the music first (``music_removed``). Its labels are
+    coarse (any tense, raised voice is "angry"), so ``read_emotion=False`` reads only the tone."""
+    import soundfile as sf
+
+    from .dubbing import (
+        _segment,
+        _speech_units,
+        describe_tone,
+        load_emotion_model,
+        measure_line,
+        parse_sensevoice_emotion,
+        speaker_baseline,
+    )
+
+    probes = []
+    for line in lines:
+        if line.duration <= 0.2:
+            continue
+        if regions is not None:
+            heard = sum(max(0.0, min(b, line.end) - max(a, line.start)) for a, b in regions)
+            if heard < max(0.15, 0.25 * line.duration):
+                continue  # no speech in the video at this line's time
+        seg = _segment(audio, sr, line.start, line.end)
+        probe = replace(line, features=measure_line(seg, sr))
+        units = _speech_units(line.text)
+        probe.features["rate"] = units / line.duration if line.duration > 0.3 and units else None
+        probes.append(probe)
+    found = {}
+    for name in dict.fromkeys(p.speaker for p in probes):
+        own = [p for p in probes if p.speaker == name]
+        baseline = speaker_baseline(own)
+        for probe in own:
+            found[probe.index] = {"emotion": "", "tone": describe_tone(probe, baseline), "music": False}
+
+    if not read_emotion:
+        return found
+    clip_dir = Path(clip_dir)
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for probe in probes:
+        path = clip_dir / f"line_{probe.index:04d}.wav"
+        sf.write(str(path), _segment(audio, sr, probe.start, probe.end, pad=0.1), sr)
+        paths.append(str(path))
+    try:
+        model = emotion_model or load_emotion_model()
+        results = model.generate(input=paths, language="auto", use_itn=False) if paths else []
+        heard = {str(r.get("key")): r.get("text", "") for r in results}
+        for probe, path in zip(probes, paths):
+            raw = heard.get(Path(path).stem, "")
+            if "<|BGM|>" in raw and not music_removed:
+                found[probe.index]["music"] = True  # its "emotion" is mostly the music's
+                continue
+            found[probe.index]["emotion"] = parse_sensevoice_emotion(raw)
+    except Exception as exc:  # the tone still helps without the emotion
+        logger.warning("Emotion detection from the video skipped: %s", exc)
+    return found
+
+
+def apply_tones(lines: list[SubtitleLine], tones: dict[int, dict]) -> int:
+    """Use the emotion and tone read from the video (:func:`tones_from_audio`) for each line (in place).
+
+    An emotion written in the line's tag always wins; a detected emotion replaces the guess from punctuation
+    (a "neutral" reading keeps the guess). Returns how many lines got something from the video."""
+    used = 0
+    for line in lines:
+        found = tones.get(line.index)
+        if not found:
+            continue
+        used += 1
+        line.tone = found.get("tone") or ""
+        emotion = (found.get("emotion") or "").strip().lower()
+        if emotion and emotion != "neutral" and not line.features.get("emotion_tagged"):
+            line.emotion = emotion
+            line.features.pop("emotion_guessed", None)
+            line.features["emotion_from_video"] = True
+    return used
 
 
 # -----------------------------
@@ -625,6 +753,7 @@ __all__ = [
     "ScriptResult",
     "ScriptVoicer",
     "VoiceTag",
+    "apply_tones",
     "failed_lines",
     "generated_lines",
     "load_results",
@@ -637,5 +766,6 @@ __all__ = [
     "pitch_range",
     "read_script",
     "speaker_summary",
+    "tones_from_audio",
     "voice_description",
 ]

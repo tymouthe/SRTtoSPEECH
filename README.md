@@ -371,13 +371,41 @@ voxcpm srt --srt script.srt --output script.wav --workdir work --regenerate 5,31
 # voices.json: {"Dara": {"gender": "male", "age": "kid", "description": "cheeky little boy", "reference": "dara.wav"}}
 ```
 
-The web demo has the same workflow in the **📝 SRT → Speech** tab: listen to and download every line (or all of
+The web demo has the same workflow in the **📝 SRT → Speech** tab (where you can also add the **original video**:
+**Analyze** then reads each line's tone — louder, softer, livelier, faster, … than that speaker usually is — from
+the original speech at its SRT time; optionally also a rough emotion (SenseVoice) for lines with none in their tag): listen to and download every line (or all of
 them as one `.zip`), **🔁 Regenerate** the lines that need a look (they are pre-selected), or give a speaker a
 **🎭 New voice** (their voice is designed again and all of their lines are regenerated).
 Projects are saved as you go in `~/.voxcpm/srt_projects/` (set `VOXCPM_PROJECTS_DIR` to change it): closing or
 reloading the tab does not stop a generation, and reopening the page brings back the last project — its tables, every
 line already generated, and the progress of a run still going. Lines left unfinished (⏳) can be finished with
 **Regenerate**.
+
+When the lines are generated, **🎬 Next: place the vocals on your video** opens the **🎬 Video Editor** tab (needs
+`ffmpeg`). Drop in the video: every line becomes a clip on its speaker's track at its subtitle time, and the speech in
+the video's own soundtrack is found and shown on a **Video speech** track (optionally after separating the voices from
+the music), so **🎯 Align all to video speech** can line every clip up with the speech it replaces. Like in a video
+editor you can play it all back over the video, drag clips (with snapping) left / right in time and up / down to
+another row (clips that end up overlapping after aligning are put on separate rows, or **⇥ Remove overlaps** moves them
+apart), trim their edges, **✂ cut** a clip at the playhead (or Alt+click) and move or delete the pieces, **🔗 join** the
+pieces back, speed a clip up or slow it down (0.5×–2×, pitch kept; **Fit to subtitle** makes it fill its subtitle
+time), nudge clips, keep every voice at the same loudness (**🎚 Level voices**, on by default: each clip is measured as it
+plays — after trims, cuts, speed changes and regeneration — and brought to the same speech level, evened out from the inside too —
+loud words turned down, quiet ones up, 3:1 — with a limiter so nothing clips; a clip's own volume is a change on top), change their volume, switch the **original video sound** on / off (🔊 in the toolbar, **M** on the Video speech track, or O), show the lines as captions on the preview (**CC**, off by default, never in the export), work in **⛶ Full screen** (F; drag the bar under the video to give the timeline more room), mute a clip or a whole speaker, undo / redo, and edit a line's text,
+emotion or speaker and
+**🔁 Regenerate** it (or give a speaker a **🎭 New voice**) without losing its place on the timeline. **⬇ Export
+video** writes the video with the new voices over the original soundtrack: by default the original is muted wherever a
+new voice replaces it (the whole stretch of original speech it covers) and kept everywhere else. Subtitles burned into the
+picture are found and **removed** (filled in from around them, or blurred; **✏️ Area** moves the box), which
+re-encodes the picture at its original size, codec and frame rate; with them kept, the picture is copied as it is. **New subtitles** are made from the
+voice lines (one per line, on its voice's time) and drawn where the original ones were (or near the bottom): edit
+them on the **💬 Subtitles** track above the video speech — double-click or **+** / N to add one, drag it or its
+edges to change its time (subtitles that overlap in time go on separate rows — drag up/down or Alt+↑/↓; a
+higher row is drawn right above the lower ones on the video), click it to edit its text or split it, Delete to remove it, **↻ Make again from the
+voices** to start over. The editor draws them (so Khmer and other complex scripts look right) and the export
+burns exactly that into the picture; it can also be lowered
+under the new voices, kept, have **its voices removed** (music and sound effects kept — separated as soon as you
+choose it, so you hear it while editing), or muted, plus the soundtrack and the new voices alone as `.wav`. The edit is saved with the project.
 
 ### Web Demo
 

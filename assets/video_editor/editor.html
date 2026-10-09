@@ -1,0 +1,97 @@
+<div class="vxe" tabindex="-1">
+  <div class="vxe-banner" data-role="banner"></div>
+  <div class="vxe-top">
+    <div class="vxe-viewer" data-role="viewer">
+      <video data-role="video" playsinline preload="auto"></video>
+      <audio data-role="music" preload="auto"></audio>
+      <div class="vxe-audio-name" data-role="audio-name"></div>
+      <div class="vxe-subbox" data-role="subbox" title="Original subtitles are hidden here (✏️ Area to move it)">
+        <div class="vxe-subbox-h" data-corner="nw"></div><div class="vxe-subbox-h" data-corner="ne"></div>
+        <div class="vxe-subbox-h" data-corner="sw"></div><div class="vxe-subbox-h" data-corner="se"></div>
+      </div>
+      <div class="vxe-caption" data-role="caption"></div>
+      <canvas class="vxe-subcanvas" data-role="subcanvas"></canvas>
+      <div class="vxe-drop" data-role="drop">
+        <div class="vxe-drop-title">🎬 Drop your video (or audio, e.g. .wav) here</div>
+        <div class="vxe-drop-sub">or</div>
+        <label class="vxe-btn vxe-primary">Choose a video or audio file…<input type="file" accept="video/*,audio/*,.mkv,.avi,.mov,.mp4,.webm,.wav,.mp3,.m4a,.aac,.flac,.ogg,.opus" data-role="file" hidden></label>
+        <label class="vxe-check"><input type="checkbox" data-role="isolate-upload"> Isolate voices first (slower, better when there is music)</label>
+        <div class="vxe-drop-sub">Every generated line is placed on its subtitle time, and the speech in the video is found so you can line them up.</div>
+      </div>
+      <div class="vxe-busy" data-role="busy"><div class="vxe-spinner"></div><div data-role="busy-text">Working…</div></div>
+    </div>
+    <div class="vxe-inspector" data-role="inspector"></div>
+  </div>
+  <div class="vxe-split" data-role="split" title="Drag to give more room to the video or to the timeline"></div>
+  <div class="vxe-toolbar">
+    <div class="vxe-group">
+      <button class="vxe-btn vxe-icon" data-act="start" title="Go to start (Home)">⏮</button>
+      <button class="vxe-btn vxe-icon" data-act="prev" title="Previous clip (↑)">⏪</button>
+      <button class="vxe-btn vxe-icon vxe-play" data-act="play" title="Play / pause (Space)">▶</button>
+      <button class="vxe-btn vxe-icon" data-act="next" title="Next clip (↓)">⏩</button>
+      <span class="vxe-time" data-role="time">00:00.00</span>
+    </div>
+    <div class="vxe-group">
+      <button class="vxe-btn vxe-icon" data-act="undo" title="Undo (Ctrl/⌘+Z)">↶</button>
+      <button class="vxe-btn vxe-icon" data-act="redo" title="Redo (Ctrl/⌘+Shift+Z)">↷</button>
+      <label class="vxe-check" title="Snap clips to the playhead, detected speech and other clips while dragging (hold Alt to switch off)"><input type="checkbox" data-role="snap" checked> Snap</label>
+    </div>
+    <div class="vxe-group">
+      <button class="vxe-btn" data-act="cut-sel" title="Cut the selected clip(s) — or every clip — at the playhead (C). Alt+click a clip cuts it where you click.">✂ Cut</button>
+      <button class="vxe-btn" data-act="join-sel" title="Connect the pieces of a cut line back together (J)">🔗 Join</button>
+      <button class="vxe-btn" data-act="stack" title="Put clips that play at the same time on separate rows, so you can see and move each one">↕ Stack overlaps</button>
+      <button class="vxe-btn" data-act="spread" title="Move clips later where needed so no two new voices play at the same time">⇥ Remove overlaps</button>
+    </div>
+    <div class="vxe-group">
+      <span class="vxe-label">Zoom</span>
+      <input type="range" min="8" max="400" value="80" data-role="zoom">
+      <button class="vxe-btn" data-act="fit" title="Fit the whole video">Fit</button>
+    </div>
+    <div class="vxe-group">
+      <button class="vxe-btn" data-act="align-all" title="Move every clip to the start of the speech it replaces in the video">🎯 Align all to video speech</button>
+      <button class="vxe-btn" data-act="reset-all" title="Put every clip back on its subtitle time">⏱ All to SRT time</button>
+    </div>
+    <div class="vxe-group">
+      <button class="vxe-btn vxe-orig-toggle" data-act="orig-toggle" data-role="orig-toggle" title="Turn the original video's sound on or off (O) — in the preview and the export">🔊 Original sound: on</button>
+      <span class="vxe-label">Original audio</span>
+      <select data-role="mode">
+        <option value="replace">Muted where the new voices replace it</option>
+        <option value="duck">Lowered under the new voices</option>
+        <option value="keep">Kept as it is</option>
+        <option value="music">Voices removed (music &amp; sound effects kept)</option>
+        <option value="mute">Muted</option>
+      </select>
+      <span class="vxe-label">Orig dB</span><input type="range" min="-30" max="6" step="1" value="0" data-role="orig-gain" title="Original audio volume">
+      <button class="vxe-btn" data-act="level" data-role="level" title="Keep every voice clip at the same loudness, also after you trim, cut, speed up or regenerate it (a clip's Volume is a change on top)">🎚 Level voices: on</button>
+      <span class="vxe-label">Voices dB</span><input type="range" min="-20" max="12" step="1" value="0" data-role="voc-gain" title="Volume of all new voices">
+    </div>
+    <div class="vxe-group" data-role="subs-group">
+      <span class="vxe-label">Original subtitles</span>
+      <select data-role="subs-mode" title="Subtitles burned into the video's picture">
+        <option value="fill">Removed (filled in)</option>
+        <option value="blur">Blurred</option>
+        <option value="off">Kept</option>
+      </select>
+      <button class="vxe-btn" data-act="subs-area" title="Show the area on the video to move or resize it">✏️ Area</button>
+      <button class="vxe-btn" data-act="subs-find" title="Look for the subtitles in the picture again">🔍 Find</button>
+    </div>
+    <div class="vxe-group vxe-right">
+      <button class="vxe-btn vxe-primary" data-act="export">⬇ Export video</button>
+      <button class="vxe-btn" data-act="change-video" title="Use another video">🎞 Change video</button>
+      <button class="vxe-btn" data-act="reload" title="Reload the project from the SRT → Speech tab">⟳</button>
+      <button class="vxe-btn" data-act="captions" data-role="captions" title="Show the new subtitles on the video (preview and export); edit them on the 💬 Subtitles track">💬 Subtitles</button>
+      <button class="vxe-btn" data-act="fullscreen" title="Full screen (F) — Esc to leave">⛶ Full screen</button>
+    </div>
+  </div>
+  <div class="vxe-status" data-role="status"></div>
+  <div class="vxe-timeline" data-role="scroll">
+    <div class="vxe-content" data-role="content"></div>
+  </div>
+  <div class="vxe-help">
+    Click a clip to select it (Shift+click for more) · drag left/right to move it in time, up/down to another row · drag its edges to trim ·
+    double-click to play it · ←/→ nudge 0.05 s (Shift: 0.5 s) · Alt+↑/↓ row up/down · C cut at the playhead · Alt+click cut there ·
+    J join pieces back · [ / ] slower / faster · Delete removes a piece · M mute · S align to detected speech · R regenerate · Space play/pause ·
+    Ctrl/⌘+wheel zoom · Alt while dragging = no snapping · F full screen (Esc to leave) · O original sound on / off · N new subtitle at the playhead; double-click the 💬 Subtitles track to add one there, drag a subtitle or its edges to change its time (up/down for another row — a higher row is drawn above), Delete removes it.
+    Grey blocks on the <b>Video speech</b> track are where someone speaks in the video; red ones have no new voice over them.
+  </div>
+</div>

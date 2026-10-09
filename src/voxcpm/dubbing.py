@@ -149,7 +149,8 @@ _TIME_RE = re.compile(
     r"(\d+):(\d{1,2}):(\d{1,2})[,.](\d{1,3})\s*-->\s*(\d+):(\d{1,2}):(\d{1,2})[,.](\d{1,3})"
 )
 _TAG_RE = re.compile(r"<[^>]+>|\{\\[^}]*\}")
-_BRACKET_SPEAKER_RE = re.compile(r"^\s*[\[【]\s*([^\]】]{1,32}?)\s*[\]】]\s*[:：]?\s*(.*)$", re.S)
+# Up to 80 characters: a voice tag like "[Chen Dayong|male|adult|indifferent]" is longer than a bare name.
+_BRACKET_SPEAKER_RE = re.compile(r"^\s*[\[【]\s*([^\]】]{1,80}?)\s*[\]】]\s*[:：]?\s*(.*)$", re.S)
 _COLON_SPEAKER_RE = re.compile(r"^\s*([^\s:：\-][^:：\n]{0,23}?)\s*[:：]\s+(.+)$", re.S)
 
 
