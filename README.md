@@ -371,6 +371,19 @@ voxcpm srt --srt script.srt --output script.wav --workdir work --regenerate 5,31
 # voices.json: {"Dara": {"gender": "male", "age": "kid", "description": "cheeky little boy", "reference": "dara.wav"}}
 ```
 
+**Voice templates:** instead of a new voice designed from each speaker's first line, give a speaker a ready voice
+(**🎙 Give a speaker a voice template**; the Speakers table's *Voice* column). Templates are kept in
+`~/.voxcpm/voices/` (`VOXCPM_VOICES_DIR`) for all your projects: make the starter voices once (Man, Woman, Young
+man, Young woman, Old man, Old woman, Boy, Girl, Kid, Narrator — the same voice every time), make your own from a
+description, keep a voice you like from a project, or upload a clip. Every line of the speaker copies the template
+and adds its own emotion; **🎭 New voice** redoes their lines with it. On **Analyze**, each speaker is given the template
+that fits them best (🪄, on by default): one of their gender and age, an old / young / narrator voice when their
+name or description says so, the closest in pitch to their voice in the original video if you added it, and a
+different voice for each speaker where there is a choice; **🪄 Pick the best voices** does it again. To work **one speaker at a time**, choose a speaker under
+**…or one speaker at a time** and click **▶ Generate only this speaker's lines**: all of their lines are made (the
+combined track has the lines made so far), you listen, then the next speaker; **Generate all lines** then makes the
+rest. Generating everything also goes speaker by speaker (the one with the most lines first).
+
 The web demo has the same workflow in the **📝 SRT → Speech** tab (where you can also add the **original video**:
 **Analyze** then reads each line's tone — louder, softer, livelier, faster, … than that speaker usually is — from
 the original speech at its SRT time; optionally also a rough emotion (SenseVoice) for lines with none in their tag): listen to and download every line (or all of
@@ -390,8 +403,15 @@ another row (clips that end up overlapping after aligning are put on separate ro
 apart), trim their edges, **✂ cut** a clip at the playhead (or Alt+click) and move or delete the pieces, **🔗 join** the
 pieces back, speed a clip up or slow it down (0.5×–2×, pitch kept; **Fit to subtitle** makes it fill its subtitle
 time), nudge clips, keep every voice at the same loudness (**🎚 Level voices**, on by default: each clip is measured as it
-plays — after trims, cuts, speed changes and regeneration — and brought to the same speech level, evened out from the inside too —
-loud words turned down, quiet ones up, 3:1 — with a limiter so nothing clips; a clip's own volume is a change on top), change their volume, switch the **original video sound** on / off (🔊 in the toolbar, **M** on the Video speech track, or O), show the lines as captions on the preview (**CC**, off by default, never in the export), work in **⛶ Full screen** (F; drag the bar under the video to give the timeline more room), mute a clip or a whole speaker, undo / redo, and edit a line's text,
+plays — after trims, cuts, speed changes and regeneration — by how loud it *sounds* (ITU-R BS.1770 K-weighting, so a deep
+voice and a bright shout come out even) and brought to the same level, evened out from the inside too — loud words turned
+down, quiet ones up — with a limiter so nothing clips; a clip's own volume is a change on top; **⚙ Levels** opens the
+**🎚 Voice levels** panel: choose how loud every voice is, how strongly each line is evened out (off / light / normal /
+strong), see every clip's loudness against the others with the ones that stand out marked (click one to select it), and
+reset every clip's own volume to 0 dB in one go), change their volume, edit the **original sound** like the clips on its own **🎞 Original sound** track (click it to select a part,
+C cuts it at the playhead, J joins parts; each part has its own volume and sound — as set, the full original with its
+voices, e.g. to keep a real scream, voices removed, or silent; parts stay in time with the picture), switch the
+**original video sound** on / off (🔊 in the toolbar, **M** on the Video speech track, or O), show the lines as captions on the preview (**CC**, off by default, never in the export), work in **⛶ Full screen** (F; drag the bar under the video to give the timeline more room), mute a clip or a whole speaker, undo / redo, and edit a line's text,
 emotion or speaker and
 **🔁 Regenerate** it (or give a speaker a **🎭 New voice**) without losing its place on the timeline. **⬇ Export
 video** writes the video with the new voices over the original soundtrack: by default the original is muted wherever a

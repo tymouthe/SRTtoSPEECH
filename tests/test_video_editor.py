@@ -285,3 +285,64 @@ def test_level_voices_also_evens_out_a_line_from_the_inside():
     assert before > 15 and after < 7, (before, after)  # 3:1 (at most 9 dB each way), glides between words
     silence = np.zeros(sr, dtype=np.float32)
     assert np.abs(video_editor.even_out(np.concatenate([_speechy(1.0), silence]), sr)[-sr // 2:]).max() == 0  # pauses stay silent
+
+
+def test_level_voices_measures_loudness_as_heard():
+    sr = 16_000
+    t = np.arange(int(1.5 * sr)) / sr
+    deep = (0.5 * np.sin(2 * np.pi * 110 * t)).astype(np.float32)  # same power, but a low hum sounds quieter...
+    bright = (0.5 * np.sin(2 * np.pi * 3000 * t)).astype(np.float32)  # ...than a bright tone
+    raw = video_editor.speech_level(deep, sr, weighted=False) - video_editor.speech_level(bright, sr, weighted=False)
+    heard = video_editor.speech_level(bright, sr) - video_editor.speech_level(deep, sr)
+    assert abs(raw) < 0.1 and 3 < heard < 5, (raw, heard)
+    # So levelling turns the bright one down against the deep one, and both then sound as loud.
+    a = video_editor.clip_audio(deep, sr, {}, level=True)
+    b = video_editor.clip_audio(bright, sr, {}, level=True)
+    assert abs(video_editor.speech_level(a, sr) - video_editor.speech_level(b, sr)) < 0.3
+    assert np.sqrt(np.mean(b**2)) < np.sqrt(np.mean(a**2))
+
+
+def test_level_voices_target_and_strength_can_be_chosen():
+    sr = 16_000
+    wav = _speechy(1.5) * 0.3
+    for target in (-26, -14):
+        part = video_editor.clip_audio(wav, sr, {}, level={"target": target})
+        assert abs(video_editor.speech_level(part, sr) - target) < 1.0
+    assert video_editor.level_options(False) is None
+    assert video_editor.level_options({}) == {"target": video_editor.LEVEL_TARGET_DB, "strength": "normal"}
+    assert video_editor.level_options({"target": -99, "strength": "??"}) == {"target": -30.0, "strength": "normal"}
+    loud_then_quiet = np.concatenate([_speechy(1.0) * 1.0, _speechy(1.0, seed=1) * 0.15])
+
+    def spread(strength):
+        out = video_editor.clip_audio(loud_then_quiet, sr, {}, level={"strength": strength})
+        return video_editor.speech_level(out[200:sr - 4000], sr) - video_editor.speech_level(out[sr + 4000:], sr)
+
+    off, light, normal, strong = (spread(x) for x in ("off", "light", "normal", "strong"))
+    assert off > light > normal > strong, (off, light, normal, strong)
+    assert off > 15 and strong < 5
+
+
+def test_original_sound_sections_have_their_own_volume_and_sound():
+    sr = 1000
+    voice = np.full(1000, 0.5, dtype=np.float32)
+    clips = [({"start": 1.0}, voice), ({"start": 5.0}, voice)]
+    original = np.full(8000, 0.2, dtype=np.float32)  # voices + music
+    music = np.full(8000, 0.05, dtype=np.float32)  # music only
+    regions = [(1.0, 2.0), (5.0, 6.0)]
+    sections = [
+        {"start": 0.0, "end": 3.0, "gain_db": 0, "sound": "auto"},  # as set: original voices taken out under the clip
+        {"start": 3.0, "end": 4.5, "gain_db": -6.0206, "sound": "auto"},  # half as loud
+        {"start": 4.5, "end": 6.5, "gain_db": 0, "sound": "full"},  # keep the original voices here (a real scream)
+        {"start": 6.5, "end": 7.2, "gain_db": 0, "sound": "music"},  # voices removed
+        {"start": 7.2, "end": 8.0, "gain_db": 0, "sound": "mute"},
+    ]
+    mixed = video_editor.render_mix(clips, 8.0, sr, original=original, mode="replace", regions=regions,
+                                    sections=sections, full=original, music=music)
+    assert abs(mixed[500] - 0.2) < 1e-3  # outside the voices: the original
+    assert abs(mixed[1500] - 0.5) < 1e-3  # under the new voice: only it ("replace")
+    assert abs(mixed[3700] - 0.1) < 1e-3  # -6 dB section
+    assert abs(mixed[5500] - 0.7) < 1e-3  # full original kept under the new voice
+    assert abs(mixed[6800] - 0.05) < 1e-3  # music only
+    assert abs(mixed[7600]) < 1e-6  # silent
+    no_sections = video_editor.render_mix(clips, 8.0, sr, original=original, mode="replace", regions=regions)
+    assert abs(no_sections[5500] - 0.5) < 1e-3  # without sections: as before

@@ -51,7 +51,7 @@ def test_read_script_tags_speakers_once_and_guesses_missing_emotions():
     assert [l.speaker for l in lines] == ["Dara", "Srey", "Dara", "Narrator"]
     assert (profiles["Dara"].gender, profiles["Dara"].age) == ("male", "kid")
     assert (profiles["Srey"].gender, profiles["Srey"].age) == ("female", "adult")
-    assert profiles["Dara"].description.startswith("Young boy's voice")
+    assert profiles["Dara"].description.startswith("Young boy")
     assert all(p.voice_mode == "clone_first" for p in profiles.values())
     assert [l.emotion for l in lines] == ["sad", "happy", "surprised", "hesitant"]
     assert lines[1].features["emotion_guessed"] and "emotion_guessed" not in lines[0].features
@@ -88,7 +88,7 @@ class _StubModel:
         kid = "boy" in kwargs["text"]
         designing = kid and kwargs["reference_wav_path"] is None
         too_low = designing and len([c for c in self.calls if "boy" in c["text"]]) == 1
-        return _tone(140 if too_low else 300 if kid else 210, 1.5, self.tts_model.sample_rate)
+        return _tone(140 if too_low else 250 if kid else 210, 1.5, self.tts_model.sample_rate)
 
 
 def test_voice_script_makes_one_neutral_voice_per_speaker_and_clones_it_for_every_line(tmp_path):
@@ -110,7 +110,8 @@ def test_voice_script_makes_one_neutral_voice_per_speaker_and_clones_it_for_ever
     line_calls = [c for c in model.calls if c["reference_wav_path"] is not None]
     assert len(line_calls) == 4
     assert line_calls[0]["reference_wav_path"].endswith("voice_Dara.wav") and "sad" in line_calls[0]["text"]
-    assert line_calls[2]["reference_wav_path"].endswith("voice_Dara.wav") and "surprised" in line_calls[2]["text"]
+    # speaker by speaker: Dara (most lines) has both of hers made first
+    assert line_calls[1]["reference_wav_path"].endswith("voice_Dara.wav") and "surprised" in line_calls[1]["text"]
     by_index = {r["index"]: r for r in result.report}
     assert by_index[1]["mode"] == by_index[3]["mode"] == "clone→#1 (neutral)"
     assert Path(result.audio_path).exists()
@@ -208,11 +209,12 @@ def test_regenerate_redoes_only_the_chosen_lines_with_new_seeds(tmp_path):
     assert {p.name: p.stat().st_mtime_ns for p in Path(again.lines_dir).glob("*.wav") if not p.name.startswith("0003_")} == kept
 
 
-def test_regenerate_needs_a_first_run(tmp_path):
+def test_some_lines_can_be_made_without_a_first_run(tmp_path):
     lines, profiles = script_voice.read_script(dubbing.parse_srt(SCRIPT))
     voicer = script_voice.ScriptVoicer(_StubModel(), tmp_path / "work")
-    with pytest.raises(ValueError, match="Generate all lines first"):
-        voicer.regenerate(lines, profiles, str(tmp_path / "x.wav"), [1], dubbing.DubOptions(verify_voice=False))
+    opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1)
+    result = voicer.regenerate(lines, profiles, str(tmp_path / "x.wav"), [1], opts)
+    assert [r["index"] for r in result.report] == [1]
 
 
 def test_failed_lines_lists_inconsistent_and_unclear_gender_lines():
@@ -285,11 +287,11 @@ def test_progress_is_saved_per_line_and_results_can_be_reloaded(tmp_path):
     opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1)
     with pytest.raises(RuntimeError):
         script_voice.ScriptVoicer(Crash(), workdir).voice(lines, profiles, str(out), opts)
-    assert script_voice.generated_lines(workdir) == {1, 2}  # kept although the run stopped
+    assert script_voice.generated_lines(workdir) == {1, 3}  # kept although the run stopped (Dara's lines come first)
     assert script_voice.load_results(workdir, out) is None  # no finished run yet
 
     lines, profiles = script_voice.read_script(dubbing.parse_srt(SCRIPT))
-    script_voice.ScriptVoicer(_StubModel(), workdir).regenerate(lines, profiles, str(out), [3, 4], opts)
+    script_voice.ScriptVoicer(_StubModel(), workdir).regenerate(lines, profiles, str(out), [2, 4], opts)
     loaded = script_voice.load_results(workdir, out)
     assert loaded is not None and [r["index"] for r in loaded.report] == [1, 2, 3, 4]
     assert Path(loaded.audio_path).exists() and set(loaded.voices) == {"Dara", "Srey", "Narrator"}
@@ -359,3 +361,124 @@ def test_long_voice_tags_are_read_and_unclear_tags_are_reported(tmp_path):
     assert len(problems) == 2
     assert "young_adult|mocking" in problems[0] and "'mocking' is used as the emotion" in problems[0]
     assert problems[1].startswith("Line 3:") and "could not be read" in problems[1]
+
+
+def test_voice_templates_are_kept_in_a_library_and_used_for_every_line(tmp_path):
+    library = tmp_path / "voices"
+    model = _StubModel()
+    voicer = script_voice.ScriptVoicer(model, tmp_path / "make")
+    opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1, first_line_attempts=2)
+    made = script_voice.make_voice_template(voicer, "Woman", "female", "adult", "warm woman", seed=5, options=opts,
+                                            starter=True, directory=library)
+    assert Path(made["path"]).exists() and made["starter"]
+    assert model.calls[-1]["reference_wav_path"] is None and "calm and neutral" in model.calls[-1]["text"]
+    assert set(script_voice.load_voice_library(library)) == {"Woman"}
+    assert script_voice.template_voice("auto", library) is None
+    with pytest.raises(ValueError):
+        script_voice.template_voice("Nobody", library)
+
+    # A speaker with a template copies it for every line: nothing is designed from their first line.
+    lines, profiles = script_voice.read_script(dubbing.parse_srt(
+        "1\n00:00:00,000 --> 00:00:02,000\n[Srey|female] hello there\n\n2\n00:00:02,000 --> 00:00:04,000\n[Srey|sad] again\n"
+    ))
+    profiles["Srey"].reference_wav = script_voice.template_voice("Woman", library)["path"]
+    model.calls.clear()
+    voicer = script_voice.ScriptVoicer(model, tmp_path / "work")
+    out = str(tmp_path / "out" / "script.wav")
+    voicer.voice(lines, profiles, out, opts)
+    assert all(c["reference_wav_path"] == made["path"] for c in model.calls)
+    # "New voice" for a speaker with a template redoes their lines with the template, it does not design one.
+    model.calls.clear()
+    voicer.voice(lines, profiles, out, opts, only=(), new_voices={"Srey"})
+    assert len(model.calls) == 2 and all(c["reference_wav_path"] == made["path"] for c in model.calls)
+
+    script_voice.save_voice_template("Mine", made["path"], "female", "adult", directory=library)
+    script_voice.delete_voice_template("Woman", directory=library)
+    assert set(script_voice.load_voice_library(library)) == {"Mine"}
+
+
+def _fake_library(**pitches):
+    starters = {v["name"]: v for v in script_voice.STARTER_VOICES}
+    return {n: dict(starters[n], path="", pitch_hz=f) for n, f in pitches.items()}
+
+
+def test_match_templates_fits_gender_age_words_and_real_pitch():
+    library = _fake_library(**{"Man": 100, "Young man": 125, "Old man": 110, "Woman": 245, "Young woman": 215,
+                               "Old woman": 220, "Boy": 240, "Girl": 250, "Kid": 275, "Narrator": 150})
+    P = dubbing.SpeakerProfile
+    profiles = {
+        "Chen Fan": P(name="Chen Fan", gender="male", age="adult", description="Adult man"),
+        "Chen Dayong": P(name="Chen Dayong", gender="male", age="adult", description="Adult man"),
+        "Sun Shi": P(name="Sun Shi", gender="female", age="adult", description="Adult woman"),
+        "Grandpa": P(name="Grandpa", gender="male", age="adult", description="old village chief"),
+        "Dara": P(name="Dara", gender="male", age="kid", description=""),
+        "Narrator": P(name="Narrator", gender="unknown", age="adult", description=""),
+    }
+    counts = {"Chen Fan": 25, "Sun Shi": 9, "Chen Dayong": 2, "Grandpa": 3, "Dara": 4, "Narrator": 2}
+    picked = script_voice.match_templates(profiles, library, counts)
+    assert picked["Chen Fan"] == "Man" and picked["Sun Shi"] == "Woman" and picked["Dara"] == "Boy"
+    assert picked["Grandpa"] == "Old man" and picked["Narrator"] == "Narrator"
+    assert picked["Chen Dayong"] != "Man" and library[picked["Chen Dayong"]]["gender"] == "male"  # a different man
+
+    # With their real voices from the video: the closest in pitch (a high-voiced man gets the young man's voice).
+    picked = script_voice.match_templates(profiles, library, counts, pitches={"Chen Fan": 128, "Sun Shi": 212})
+    assert picked["Chen Fan"] == "Young man" and picked["Sun Shi"] == "Young woman"
+    assert script_voice.match_templates(profiles, {}, counts) == {}
+
+
+def test_match_templates_gives_two_low_voiced_men_different_voices():
+    library = _fake_library(**{"Man": 100, "Young man": 123, "Old man": 111, "Woman": 250, "Young woman": 183})
+    P = dubbing.SpeakerProfile
+    profiles = {n: P(name=n, gender="male", age="adult", description="Adult man") for n in ("Chen Fan", "Chen Dayong")}
+    picked = script_voice.match_templates(profiles, library, {"Chen Fan": 25, "Chen Dayong": 2},
+                                          pitches={"Chen Fan": 78, "Chen Dayong": 73})  # both lower than any template
+    assert picked["Chen Fan"] == "Man"  # the main character chooses first
+    assert picked["Chen Dayong"] in ("Young man", "Old man")
+
+
+def test_one_speaker_can_be_generated_first_and_the_rest_later(tmp_path):
+    lines, profiles = script_voice.read_script(dubbing.parse_srt(SCRIPT))
+    model = _StubModel()
+    voicer = script_voice.ScriptVoicer(model, tmp_path / "work")
+    opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1)
+    out = str(tmp_path / "out" / "script.wav")
+    dara = {l.index for l in lines if l.speaker == "Dara"}
+    first = voicer.voice(lines, profiles, out, opts, only=dara)  # a fresh project: only Dara's lines
+    assert {r["index"] for r in first.report} == dara
+    assert any("not generated yet" in w for w in first.warnings) and Path(first.audio_path).exists()
+    assert script_voice.generated_lines(tmp_path / "work") == dara
+
+    model.calls.clear()
+    rest = {l.index for l in lines} - dara
+    voicer = script_voice.ScriptVoicer(model, tmp_path / "work")  # a new run, as the app does
+    done = voicer.voice(lines, profiles, out, opts, only=rest)  # the others later
+    assert {r["index"] for r in done.report} == {l.index for l in lines}
+    assert not any("not generated yet" in w for w in done.warnings)
+    assert not any("boy" in c["text"] for c in model.calls)  # Dara's lines (and voice) were not made again
+
+
+def test_generate_all_goes_speaker_by_speaker(tmp_path):
+    lines, profiles = script_voice.read_script(dubbing.parse_srt(SCRIPT))
+    model = _StubModel()
+    voicer = script_voice.ScriptVoicer(model, tmp_path / "work")
+    opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1)
+    voicer.voice(lines, profiles, str(tmp_path / "s.wav"), opts)
+    made = [Path(c["reference_wav_path"]).stem for c in model.calls if c["reference_wav_path"]]
+    assert made == ["voice_Dara", "voice_Dara", "voice_Srey", "voice_Narrator"]  # Dara (most lines) first
+
+
+def test_make_voice_template_keeps_the_version_that_sounds_most_like_its_gender(tmp_path):
+    model = _StubModel()
+    voicer = script_voice.ScriptVoicer(model, tmp_path / "make")
+    opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1, first_line_attempts=2)
+    male, female = np.array([1.0, 0.0]), np.array([0.0, 1.0])
+    leans = iter([np.array([0.2, 0.9]), np.array([0.9, 0.3]), np.array([0.5, 0.5])])  # girlish, boyish, neither
+    made = script_voice.make_voice_template(
+        voicer, "Boy", "male", "kid", "a boy", seed=1, options=opts, directory=tmp_path / "voices",
+        candidates=3, gender_refs={"male": [male], "female": [female]}, embed=lambda path: next(leans),
+    )
+    designs = [c["seed"] for c in model.calls if c["reference_wav_path"] is None]
+    assert len(designs) == len(set(designs))  # every version (and every retry) has its own seed
+    scores = made["candidate_scores"]
+    assert len(scores) == 3 and scores.index(max(scores)) == 1  # the boyish one is kept
+    assert script_voice.gender_lean(np.array([0.9, 0.3]), [male], [female]) > 0

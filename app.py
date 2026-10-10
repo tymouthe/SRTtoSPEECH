@@ -402,7 +402,13 @@ _SRT_INSTRUCTIONS = (
     "💾 Your project is saved as you go: if you close or reload this tab, reopening the page brings back your tables and "
     "every line already generated, and a generation in progress keeps running in the background."
 )
-_SRT_SPEAKER_HEADERS = ["Speaker", "Gender", "Age", "Voice description", "Lines"]
+# Voice: a voice template from the library, or "auto" (designed from the speaker's first line). It is last, so
+# projects saved before it still load.
+_SRT_SPEAKER_HEADERS = ["Speaker", "Gender", "Age", "Voice description", "Lines", "Voice"]
+
+
+def _speaker_rows_6(rows) -> list:
+    return [(list(r) + [""] * 6)[:5] + [str((list(r) + [""] * 6)[5] or "auto")] for r in rows or []]
 # Tone (louder, softer, faster, … read from the original video) is last, so projects saved before it still load.
 _SRT_LINE_HEADERS = ["#", "Start", "End", "Speaker", "Emotion", "Text", "Tone"]
 _EMOTION_MARKS = ("(guessed)", "(from video)")
@@ -485,6 +491,22 @@ def _srt_tables_rev(workdir: Optional[str]) -> int:
 _SRT_DEFAULT_OPTIONS = [True, 8, 1.1, False, True, 0.2, 2.0, 10]
 
 
+def _voice_library_dir() -> Path:
+    from voxcpm import script_voice
+
+    script_voice.VOICE_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    return script_voice.VOICE_LIBRARY_DIR
+
+
+def _template_choices() -> list:
+    from voxcpm import script_voice
+
+    library = script_voice.load_voice_library()
+    return [("Auto — designed from their first line", script_voice.AUTO_VOICE)] + [
+        (f"{name} ({v['gender']}, {v['age']})", name) for name, v in sorted(library.items(), key=lambda kv: (not kv[1].get("starter"), kv[0]))
+    ]
+
+
 def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
     """The SRT → Speech tab. Returns what the video editor tab needs: ``start_job(workdir, speaker_rows,
     line_rows, options, only, new_voices)`` to regenerate lines, and the hand-over between the two tabs."""
@@ -495,7 +517,10 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
     speaker_models = {}
     no_change = gr.update()
 
-    def _analyze(srt_path, guess_emotion, video_path=None, isolate=False, video_emotion=False, progress=gr.Progress()):
+    def _analyze(
+        srt_path, guess_emotion, video_path=None, isolate=False, video_emotion=False, auto_voices=True,
+        progress=gr.Progress(),
+    ):
         if not srt_path:
             raise gr.Error("Please upload an SRT file first.")
         try:
@@ -532,6 +557,9 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
                 logger.exception("Reading the tone from the video failed")
                 notes.append(f"The tone could not be read from the video: {e}")
         speaker_rows = script_voice.speaker_summary(lines, profiles)
+        voice_note = ""
+        if auto_voices:
+            speaker_rows, voice_note = _pick_voices(workdir, speaker_rows, lines)
         line_rows = [
             [
                 l.index, round(l.start, 3), round(l.end, 3), l.speaker,
@@ -542,7 +570,45 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
             for l in lines
         ]
         _srt_save_tables(workdir, speaker_rows, line_rows, tagged)
-        return speaker_rows, line_rows, tagged, workdir, video_note + _notes(notes)
+        return speaker_rows, line_rows, tagged, workdir, video_note + voice_note + _notes(notes)
+
+    def _pick_voices(workdir, speaker_rows, lines):
+        """Give every speaker the voice template that fits them best (their gender, age and description, and how
+        they sound in the original video if the project has one). Returns (speaker rows, a note)."""
+        library = script_voice.load_voice_library()
+        rows = _speaker_rows_6(_table_rows(speaker_rows))
+        if not library:
+            return rows, ("🎙 No voice templates yet — make the starter voices under **🎙 Manage voice templates** "
+                          "to have one picked for each speaker.\n\n")
+        profiles = {
+            str(r[0]): dubbing.SpeakerProfile(name=str(r[0]), gender=str(r[1] or "unknown"), age=str(r[2] or "adult"),
+                                              description=str(r[3] or ""))
+            for r in rows if str(r[0]).strip()
+        }
+        counts = {str(r[0]): int(float(r[4] or 0)) for r in rows if str(r[0]).strip()}
+        pitches = {}
+        video_dir = Path(workdir, "video") if workdir else None
+        source = None
+        if video_dir and (video_dir / "voices16k.wav").exists():
+            source = video_dir / "voices16k.wav"  # voices separated from the music: cleaner pitch
+        elif video_dir and (video_dir / "audio16k.wav").exists():
+            source = video_dir / "audio16k.wav"
+        if source is not None:
+            import soundfile as sf
+
+            try:
+                audio, sr = sf.read(str(source), dtype="float32")
+                pitches = script_voice.speaker_pitches(lines, audio, sr)
+            except Exception as e:
+                logger.warning("Measuring the speakers' voices in the video failed: %s", e)
+        picked = script_voice.match_templates(profiles, library, counts, pitches)
+        for row in rows:
+            if str(row[0]) in picked:
+                row[5] = picked[str(row[0])]
+        how = " (matched to how they sound in the video)" if pitches else ""
+        return rows, ("🪄 Voices picked from your templates" + how + ": "
+                      + ", ".join(f"**{n}** → {t}" for n, t in picked.items())
+                      + ". Change any under **🎙 Give a speaker a voice template**.\n\n")
 
     def _video_tones(workdir, lines, video_path, isolate, read_emotion, progress):
         """Store the video in the project (the video editor uses it too) and read each line's emotion and tone
@@ -578,7 +644,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
     def _read_tables(speaker_rows, line_rows):
         profiles = {}
         for row in _table_rows(speaker_rows):
-            name, gender, age, description = (list(row) + [""] * 4)[:4]
+            name, gender, age, description, _, voice = (list(row) + [""] * 6)[:6]
             name = str(name).strip()
             if not name:
                 continue
@@ -588,9 +654,11 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
                 raise ValueError(f"Gender of {name!r} must be male, female or unknown")
             if age not in script_voice.AGES:
                 raise ValueError(f"Age of {name!r} must be adult or kid")
+            template = script_voice.template_voice(voice)  # None: designed from their first line
             profiles[name] = dubbing.SpeakerProfile(
                 name=name, gender=gender, age=age, voice_mode="clone_first",
                 description=str(description).strip() or script_voice.voice_description(gender, age),
+                reference_wav=template["path"] if template else None,
             )
         lines = []
         for row in _table_rows(line_rows):
@@ -695,7 +763,8 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
                 if "model" not in speaker_models:
                     speaker_models["model"] = dubbing.load_speaker_model()
                 voicer.speaker_model = speaker_models["model"]
-            verb = "Re-voicing" if new_voices else "Regenerating" if only else "Line"
+            verb = (f"Making {job['speaker']}'s lines" if job.get("speaker") else "Re-voicing" if new_voices
+                    else "Regenerating" if only else "Line")
 
             def _on_progress(i, n, line):
                 job["i"], job["n"] = i, n
@@ -718,14 +787,14 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
 
     def _run(
         workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
-        max_pause, cfg_value, dit_steps, progress, only=None, new_voices=(),
+        max_pause, cfg_value, dit_steps, progress, only=None, new_voices=(), speaker=None,
     ):
         if not workdir:
             raise gr.Error("Please upload an SRT and click Analyze first.")
         job = _start_job(
             workdir, speaker_rows, line_rows,
             [verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence, max_pause, cfg_value, dit_steps],
-            only, new_voices,
+            only, new_voices, speaker,
         )
         # Follow the job; if the tab is closed it simply carries on in the background.
         while job["status"] == "running":
@@ -733,14 +802,19 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
             time.sleep(0.5)
         return _finished(job, workdir, line_rows)
 
-    def _start_job(workdir, speaker_rows, line_rows, settings, only=None, new_voices=()):
-        """Start a generation in the background (raises gr.Error if the tables are wrong or a run is going)."""
+    def _start_job(workdir, speaker_rows, line_rows, settings, only=None, new_voices=(), speaker=None):
+        """Start a generation in the background (raises gr.Error if the tables are wrong or a run is going).
+        ``speaker``: make only that speaker's lines (the others are left for later)."""
         verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence, max_pause, cfg_value, dit_steps = settings
         try:
             lines, profiles = _read_tables(speaker_rows, line_rows)
         except Exception as e:
             raise gr.Error(str(e))
-        if only is not None:
+        if speaker is not None:
+            only = {l.index for l in lines if l.speaker == speaker}
+            if not only:
+                raise gr.Error(f"{speaker} has no lines in the script.")
+        elif only is not None:
             # Lines that were never generated (e.g. the run was stopped) are always finished too.
             only = set(only) | ({l.index for l in lines} - script_voice.generated_lines(workdir))
         options = dubbing.DubOptions(
@@ -761,7 +835,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
             if any(j["status"] == "running" for j in _SRT_JOBS.values()):
                 raise gr.Error("A generation is already running — wait for it to finish (its progress is shown here).")
             job = {"status": "running", "i": 0, "n": len(lines), "desc": "", "error": None, "result": None,
-                   "only": only, "new_voices": set(new_voices)}
+                   "only": only, "new_voices": set(new_voices), "speaker": speaker}
             _SRT_JOBS[workdir] = job
         _srt_save_tables(workdir, speaker_rows, line_rows, options=list(settings))
         threading.Thread(
@@ -778,7 +852,14 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
         for message in result.warnings:
             gr.Warning(message, duration=None)
         notes = _notes(result.warnings, done=True)
-        if job["new_voices"]:
+        if job.get("speaker"):
+            waiting = sorted({str(r[3]) for r in _table_rows(line_rows)
+                              if int(float(r[0])) not in {x["index"] for x in result.report}})
+            notes = (f"🎙 Made all of **{job['speaker']}**'s lines — listen to them below."
+                     + (f" Not generated yet: {', '.join(waiting)} — choose the next speaker, or click **Generate all "
+                        "lines** to make the rest." if waiting else "") + "\n\n" + notes)
+            focus = sorted(job["only"])
+        elif job["new_voices"]:
             notes = f"🎭 New voice for {', '.join(sorted(job['new_voices']))} — all of their lines were regenerated.\n\n" + notes
             focus = [r["index"] for r in result.report if r["speaker"] in job["new_voices"]]
         elif job["only"]:
@@ -792,9 +873,24 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
         workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
         max_pause, cfg_value, dit_steps, progress=gr.Progress(),
     ):
+        # Some speakers already made (one at a time): make the rest. Nothing or everything made: make all.
+        done = script_voice.generated_lines(workdir) if workdir else set()
+        total = {int(float(r[0])) for r in _table_rows(line_rows) if str(r[5]).strip()}
+        only = set() if done and total - done else None
         return _run(
             workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
-            max_pause, cfg_value, dit_steps, progress,
+            max_pause, cfg_value, dit_steps, progress, only=only,
+        )
+
+    def _generate_speaker(
+        speaker, workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
+        max_pause, cfg_value, dit_steps, progress=gr.Progress(),
+    ):
+        if not speaker:
+            raise gr.Error("Choose the speaker whose lines to make first.")
+        return _run(
+            workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
+            max_pause, cfg_value, dit_steps, progress, speaker=speaker,
         )
 
     def _regenerate(
@@ -826,7 +922,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
         if not workdir:
             return nothing
         tables = json.loads(Path(workdir, "tables.json").read_text(encoding="utf-8"))
-        speaker_rows, line_rows = tables.get("speakers", []), _line_rows_7(tables.get("lines", []))
+        speaker_rows, line_rows = _speaker_rows_6(tables.get("speakers", [])), _line_rows_7(tables.get("lines", []))
         tagged = tables.get("tagged")
         head = (speaker_rows, line_rows, workdir)
         job = _SRT_JOBS.get(workdir)
@@ -880,6 +976,13 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
                 "one from the video — a rough guess (any tense, raised voice is heard as angry)",
                 elem_classes=["switch-toggle"],
             )
+            auto_voices_input = gr.Checkbox(
+                value=True,
+                label="🪄 Give each speaker the voice template that fits them best",
+                info="From their gender, age and description (and their voice in the original video, if added); "
+                "off: a new voice is designed from each speaker's first line",
+                elem_classes=["switch-toggle"],
+            )
             isolate_input = gr.Checkbox(
                 value=False,
                 label="Separate the voices from the music first",
@@ -912,11 +1015,56 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
 
     speakers_table = gr.Dataframe(
         headers=_SRT_SPEAKER_HEADERS,
-        datatype=["str", "str", "str", "str", "number"],
-        label="🎭 Speakers — gender: male / female / unknown, age: adult / kid; the description is the voice prompt",
+        datatype=["str", "str", "str", "str", "number", "str"],
+        label="🎭 Speakers — gender: male / female / unknown, age: adult / kid; the description is the voice prompt; "
+        "Voice: a voice template (choose one below) or auto (designed from their first line)",
         interactive=True,
         wrap=True,
     )
+    with gr.Row():
+        voice_speaker = gr.Dropdown(choices=[], label="🎙 Give a speaker a voice template — speaker", scale=2)
+        voice_template = gr.Dropdown(
+            choices=_template_choices(), value=script_voice.AUTO_VOICE, label="Voice (instead of one designed from their first line)",
+            scale=3,
+        )
+        template_preview = gr.Audio(label="Listen to this voice", type="filepath", scale=3)
+        apply_voice_btn = gr.Button("✅ Use this voice", variant="secondary", scale=1)
+        pick_voices_btn = gr.Button("🪄 Pick the best voices for all speakers", variant="secondary", scale=1)
+    with gr.Accordion("🎙 Manage voice templates (kept for all your projects)", open=False):
+        gr.Markdown(
+            "A voice template is a voice you choose once and use again — for any speaker, in any project — instead of "
+            "a new random voice designed from each speaker's first line. Every line of a speaker with a template copies "
+            "it and adds its own emotion. **Make the starter voices** once (it loads VoxCPM; about 10 s per voice), make "
+            "your own from a description, keep a voice you like from a project, or upload a clip (5–15 s of one person "
+            "speaking clearly)."
+        )
+        starters_btn = gr.Button(
+            "✨ Make the starter voices — Man, Woman, Young man, Young woman, Old man, Old woman, Boy, Girl, Kid, Narrator",
+            variant="primary",
+        )
+        library_table = gr.Dataframe(
+            headers=["Voice", "Gender", "Age", "Description", "Starter"], label="Voice templates", interactive=False, wrap=True,
+        )
+        with gr.Row():
+            new_voice_name = gr.Textbox(label="New voice: name", placeholder="e.g. Grandpa", scale=2)
+            new_voice_gender = gr.Dropdown(["male", "female", "unknown"], value="male", label="Gender", scale=1)
+            new_voice_age = gr.Dropdown(list(script_voice.AGES), value="adult", label="Age", scale=1)
+            new_voice_desc = gr.Textbox(label="Description (the voice prompt)", placeholder="e.g. Old village chief, deep and slow", scale=4)
+            make_voice_btn = gr.Button("🎨 Make this voice", scale=1)
+        with gr.Row():
+            keep_speaker = gr.Dropdown(choices=[], label="Keep a speaker's voice from this project", scale=2)
+            keep_name = gr.Textbox(label="as the template", placeholder="name", scale=2)
+            keep_btn = gr.Button("⭐ Save it as a template", scale=1)
+        with gr.Row():
+            upload_clip = gr.Audio(sources=["upload"], type="filepath", label="Or upload a clip", scale=3)
+            upload_name = gr.Textbox(label="as the template", placeholder="name", scale=2)
+            upload_gender = gr.Dropdown(["male", "female", "unknown"], value="unknown", label="Gender", scale=1)
+            upload_age = gr.Dropdown(list(script_voice.AGES), value="adult", label="Age", scale=1)
+            upload_btn = gr.Button("⬆️ Save the clip", scale=1)
+        with gr.Row():
+            delete_pick = gr.Dropdown(choices=[], label="Delete a voice template", scale=3)
+            delete_btn = gr.Button("🗑 Delete", scale=1)
+        library_notes = gr.Markdown()
     lines_table = gr.Dataframe(
         headers=_SRT_LINE_HEADERS,
         datatype=["number", "number", "number", "str", "str", "str", "str"],
@@ -958,6 +1106,12 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
             dit_steps = gr.Slider(1, 50, value=10, step=1, label=I18N("dit_steps_label"))
     generate_btn = gr.Button("2️⃣ Generate all lines", variant="primary", size="lg")
     with gr.Row():
+        speaker_gen_picker = gr.Dropdown(
+            choices=[], label="…or one speaker at a time — make all of their lines first, listen, then the next speaker",
+            scale=4,
+        )
+        speaker_gen_btn = gr.Button("▶ Generate only this speaker's lines", variant="secondary", scale=1)
+    with gr.Row():
         retry_picker = gr.Dropdown(
             choices=[],
             multiselect=True,
@@ -978,9 +1132,183 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
     notes_box = gr.Markdown()
     report_table = gr.Dataframe(headers=_SRT_REPORT_HEADERS, label="📊 Report", interactive=False, wrap=True)
 
+    # ----- voice templates -----
+    def _library_view():
+        library = script_voice.load_voice_library()
+        rows = [[n, v["gender"], v["age"], v.get("description", ""), "✓" if v.get("starter") else ""]
+                for n, v in sorted(library.items(), key=lambda kv: (not kv[1].get("starter"), kv[0]))]
+        names = sorted(library)
+        return rows, gr.update(choices=_template_choices()), gr.update(choices=names, value=None)
+
+    library_outputs = [library_table, voice_template, delete_pick]
+
+    def _speaker_choices(speaker_rows, current, kept, to_make):
+        rows = [r for r in _table_rows(speaker_rows) if str(r[0]).strip()]
+        names = [str(r[0]) for r in rows]
+        # Speakers with the most lines first in the "one at a time" list (the main characters).
+        by_lines = [str(r[0]) for r in sorted(rows, key=lambda r: -float(r[4] or 0))]
+        return (gr.update(choices=names, value=current if current in names else (names[0] if names else None)),
+                gr.update(choices=names, value=kept if kept in names else None),
+                gr.update(choices=by_lines, value=to_make if to_make in names else (by_lines[0] if by_lines else None)))
+
+    def _apply_voice(speaker, template, speaker_rows, workdir):
+        if not speaker:
+            raise gr.Error("Choose the speaker first.")
+        rows = _speaker_rows_6(_table_rows(speaker_rows))
+        voice = script_voice.template_voice(template) if template else None
+        for row in rows:
+            if str(row[0]) == speaker:
+                row[5] = template or script_voice.AUTO_VOICE
+                if voice:  # the speaker takes the template's gender, age and description
+                    row[1], row[2], row[3] = voice["gender"], voice["age"], voice.get("description") or row[3]
+        done = script_voice.generated_lines(workdir) if workdir else set()
+        note = (f"🎙 **{speaker}** now uses " + (f"the voice template **{template}**." if voice else "a voice designed from their first line.")
+                + (" Their lines already made still have the old voice — click **🎭 New voice — redo all their lines** "
+                   "(with them selected) to make them again." if done else ""))
+        return rows, note
+
+    def _template_audio(template):
+        voice = script_voice.template_voice(template) if template else None
+        return voice["path"] if voice else None
+
+    def _busy_check():
+        if any(j["status"] == "running" for j in _SRT_JOBS.values()):
+            raise gr.Error("A generation is running — make voice templates when it has finished.")
+
+    def _template_voicer():
+        work = script_voice.VOICE_LIBRARY_DIR / "_work"
+        work.mkdir(parents=True, exist_ok=True)
+        return script_voice.ScriptVoicer(demo.get_or_load_voxcpm(), work)
+
+    _TEMPLATE_OPTIONS = dict(verify_voice=False, first_line_attempts=12, max_attempts=8, cfg_value=2.0, inference_timesteps=10)
+
+    def _gender_judge():
+        """Speaker embeddings of the adult templates (to keep the version of a new voice that sounds most like its
+        gender: a boy's voice is as high as a girl's) and the function that embeds a clip. ({}, None) if unavailable."""
+        import librosa
+        import soundfile as sf
+
+        try:
+            if "model" not in speaker_models:
+                speaker_models["model"] = dubbing.load_speaker_model()
+            model = speaker_models["model"]
+        except Exception as e:
+            logger.warning("Voice model unavailable for templates: %s", e)
+            return {}, None
+
+        def embed(path):
+            wav, sr = sf.read(str(path), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            if sr != dubbing.ANALYSIS_SR:
+                wav = librosa.resample(wav, orig_sr=sr, target_sr=dubbing.ANALYSIS_SR)
+            return dubbing.speaker_embedding(model, wav)
+
+        refs = {"male": [], "female": []}
+        for t in script_voice.load_voice_library().values():
+            if t.get("age") == "adult" and t.get("gender") in refs:
+                e = embed(t["path"])
+                if e is not None:
+                    refs[t["gender"]].append(e)
+        return refs, embed
+
+    def _make_starters(progress=gr.Progress()):
+        _busy_check()
+        library = script_voice.load_voice_library()
+        todo = [(i, v) for i, v in enumerate(script_voice.STARTER_VOICES) if v["name"] not in library]
+        if not todo:
+            return _library_view() + ("✅ The starter voices are all there.",)
+        progress(0, desc="Loading VoxCPM…")
+        voicer = _template_voicer()
+        made = []
+        # Adults first: their voices tell the children's versions apart (which sounds most like a boy / a girl).
+        todo.sort(key=lambda iv: iv[1]["age"] != "adult")
+        refs, embed = {}, None
+        for step, (i, v) in enumerate(todo):
+            progress(step / len(todo), desc=f"Making the voice “{v['name']}” ({step + 1}/{len(todo)})…")
+            if v["age"] == "kid" and v["gender"] != "unknown" and embed is None:
+                refs, embed = _gender_judge()
+            script_voice.make_voice_template(
+                voicer, v["name"], v["gender"], v["age"], v["description"], seed=1000 + 97 * i,
+                options=dubbing.DubOptions(**_TEMPLATE_OPTIONS), starter=True,
+                candidates=6 if v["age"] == "kid" else 1, gender_refs=refs, embed=embed,
+            )
+            made.append(v["name"])
+        return _library_view() + (f"✨ Made {len(made)} voice(s): {', '.join(made)}. Listen to them above and give them to your speakers.",)
+
+    def _make_one(name, gender, age, description, progress=gr.Progress()):
+        _busy_check()
+        if not str(name or "").strip():
+            raise gr.Error("Give the new voice a name.")
+        progress(0.1, desc="Loading VoxCPM…")
+        voicer = _template_voicer()
+        progress(0.4, desc=f"Making the voice “{name}”…")
+        import zlib
+
+        seed = zlib.crc32(f"{name}|{description}".encode("utf-8")) % 100_000  # same name and description: same voice
+        refs, embed = _gender_judge() if gender in ("male", "female") else ({}, None)
+        script_voice.make_voice_template(voicer, str(name).strip(), gender, age, str(description or "").strip(), seed=seed,
+                                         options=dubbing.DubOptions(**_TEMPLATE_OPTIONS),
+                                         candidates=4 if embed else 1, gender_refs=refs, embed=embed)
+        return _library_view() + (f"🎨 Made the voice **{name}**.",)
+
+    def _keep_speaker_voice(workdir, speaker, name, speaker_rows):
+        if not workdir or not speaker:
+            raise gr.Error("Choose a speaker of this project.")
+        state_path = Path(workdir, "script_state.json")
+        refs = json.loads(state_path.read_text(encoding="utf-8")).get("refs", {}) if state_path.exists() else {}
+        if not refs.get(speaker) or not Path(refs[speaker]).exists():
+            raise gr.Error(f"{speaker} has no voice yet — generate their lines first.")
+        row = next((r for r in _speaker_rows_6(_table_rows(speaker_rows)) if str(r[0]) == speaker), None)
+        gender, age, description = (row[1], row[2], row[3]) if row else ("unknown", "adult", "")
+        script_voice.save_voice_template(str(name or speaker).strip(), refs[speaker], gender, age, description)
+        return _library_view() + (f"⭐ Kept {speaker}'s voice as the template **{str(name or speaker).strip()}**.",)
+
+    def _upload_voice(clip, name, gender, age):
+        if not clip:
+            raise gr.Error("Upload a clip first (5–15 s of one person speaking clearly).")
+        script_voice.save_voice_template(str(name or "").strip() or Path(clip).stem, clip, gender, age, "Uploaded clip")
+        return _library_view() + (f"⬆️ Saved the clip as the template **{str(name or '').strip() or Path(clip).stem}**.",)
+
+    def _delete_voice(name):
+        if not name:
+            raise gr.Error("Choose the voice template to delete.")
+        script_voice.delete_voice_template(name)
+        return _library_view() + (f"🗑 Deleted the voice template **{name}** — give the speakers who used it another voice (or auto) before generating.",)
+
+    speakers_table.change(fn=_speaker_choices, inputs=[speakers_table, voice_speaker, keep_speaker, speaker_gen_picker],
+                          outputs=[voice_speaker, keep_speaker, speaker_gen_picker], show_progress="hidden")
+    voice_template.change(fn=_template_audio, inputs=voice_template, outputs=template_preview, show_progress="hidden")
+    def _pick_all(workdir, speaker_rows, line_rows):
+        if not _table_rows(speaker_rows):
+            raise gr.Error("Analyze a script first.")
+        try:
+            lines, _ = _read_tables(speaker_rows, line_rows)
+        except Exception:
+            lines = []
+        rows, note = _pick_voices(workdir, speaker_rows, lines)
+        done = script_voice.generated_lines(workdir) if workdir else set()
+        if done:
+            note += ("Lines already made keep their old voices — select a speaker under **🎭 New voice** and click "
+                     "**New voice — redo all their lines** to remake them with the new voice.")
+        return rows, note
+
+    pick_voices_btn.click(fn=_pick_all, inputs=[workdir_state, speakers_table, lines_table], outputs=[speakers_table, notes_box])
+    apply_voice_btn.click(fn=_apply_voice, inputs=[voice_speaker, voice_template, speakers_table, workdir_state],
+                          outputs=[speakers_table, notes_box])
+    starters_btn.click(fn=_make_starters, outputs=library_outputs + [library_notes])
+    make_voice_btn.click(fn=_make_one, inputs=[new_voice_name, new_voice_gender, new_voice_age, new_voice_desc],
+                         outputs=library_outputs + [library_notes])
+    keep_btn.click(fn=_keep_speaker_voice, inputs=[workdir_state, keep_speaker, keep_name, speakers_table],
+                   outputs=library_outputs + [library_notes])
+    upload_btn.click(fn=_upload_voice, inputs=[upload_clip, upload_name, upload_gender, upload_age],
+                     outputs=library_outputs + [library_notes])
+    delete_btn.click(fn=_delete_voice, inputs=delete_pick, outputs=library_outputs + [library_notes])
+    blocks.load(fn=_library_view, outputs=library_outputs)
+
     analyze_btn.click(
         fn=_analyze,
-        inputs=[srt_input, guess_emotion, video_input, isolate_input, video_emotion_input],
+        inputs=[srt_input, guess_emotion, video_input, isolate_input, video_emotion_input, auto_voices_input],
         outputs=[speakers_table, lines_table, tagged_output, workdir_state, notes_box],
     )
     settings = [
@@ -992,6 +1320,8 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
         retry_picker, revoice_picker, voices_state, voice_preview, editor_btn,
     ]
     generate_btn.click(fn=_generate, inputs=settings, outputs=results, api_name="voice_srt")
+    speaker_gen_btn.click(fn=_generate_speaker, inputs=[speaker_gen_picker] + settings, outputs=results,
+                          api_name="voice_srt_speaker")
     retry_btn.click(fn=_regenerate, inputs=[retry_picker] + settings, outputs=results, api_name="regenerate_srt_lines")
     revoice_btn.click(fn=_revoice, inputs=[revoice_picker] + settings, outputs=results, api_name="revoice_srt_speaker")
     line_picker.change(fn=lambda path: path, inputs=line_picker, outputs=line_player)
@@ -1332,18 +1662,31 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
             raise ValueError("No generated lines to place on the video yet.")
         out_dir = Path(workdir, "export")
         out_dir.mkdir(exist_ok=True)
-        original = None
-        if mode != "mute" and info.get("has_audio", True):
-            if mode == "music":
-                if not (info.get("music") and Path(info["music"]).exists()):
-                    info.update(video_editor.isolate_and_detect(info, Path(workdir, "video")))
-                    video_editor.save_state(workdir, state)
-                original = video_editor.read_soundtrack(info["music"], sr, out_dir / "original.wav")
-            else:
-                original = video_editor.read_soundtrack(info["source"], sr, out_dir / "original.wav")
+        original = full = music = None
+        # Parts of the original sound cut in the editor, each with its own volume and sound (none: one part).
+        sections = [x for x in (mix.get("orig_sections") or []) if float(x.get("end", 0)) > float(x.get("start", 0))]
+        if not mix.get("original_on", True):
+            sections = []
+        sounds = {x.get("sound") or "auto" for x in sections}
+        has_audio = info.get("has_audio", True)
+
+        def music_track():
+            if not (info.get("music") and Path(info["music"]).exists()):
+                info.update(video_editor.isolate_and_detect(info, Path(workdir, "video")))
+                video_editor.save_state(workdir, state)
+            return video_editor.read_soundtrack(info["music"], sr, out_dir / "music.wav")
+
+        if has_audio and (mode not in ("mute", "music") or "full" in sounds):
+            full = video_editor.read_soundtrack(info["source"], sr, out_dir / "original.wav")
+        if has_audio and (mode == "music" or "music" in sounds):
+            music = music_track()
+        if mode != "mute" and has_audio:
+            original = music if mode == "music" else full
         total = float(info["duration"])
         stem = re.sub(r"[^\w\-]+", "_", Path(info.get("name") or "video").stem)[:40] or "video"
-        level = bool(mix.get("level", True))  # "Level voices": every clip at the same loudness
+        # "Level voices": every clip at the same loudness, as set in the editor's 🎚 Voice levels panel
+        level = mix.get("level", True) and {"target": mix.get("level_target"), "strength": mix.get("level_strength")}
+        level = video_editor.level_options(level and {k: v for k, v in level.items() if v is not None})
         vocals = video_editor.render_mix(
             clips, total, sr, None, "mute", vocals_gain_db=float(mix.get("vocals_gain_db", 0)), level=level
         )
@@ -1353,6 +1696,7 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
             clips, total, sr, original, mode,
             original_gain_db=float(mix.get("original_gain_db", 0)), vocals_gain_db=float(mix.get("vocals_gain_db", 0)),
             regions=info.get("regions") or [], level=level,
+            sections=sections or None, full=full, music=music,
         )
         mix_path = out_dir / f"{stem}_soundtrack.wav"
         sf.write(str(mix_path), mixed, sr)
@@ -1630,7 +1974,8 @@ def run_demo(
         i18n=I18N,
         theme=_APP_THEME,
         css=_CUSTOM_CSS + (_EDITOR_ASSETS / "editor.css").read_text(encoding="utf-8"),
-        allowed_paths=[str(SRT_PROJECTS_DIR)],
+        # Projects and the voice templates (played in the page) are served from where they are kept.
+        allowed_paths=[str(SRT_PROJECTS_DIR), str(_voice_library_dir())],
     )
 
 

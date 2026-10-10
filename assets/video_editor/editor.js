@@ -221,6 +221,7 @@ async function loadBuffer(line) {
     S.buffers[line.url] = buf;
     keysOfLine(line.index).forEach(drawClipWave);
     if (S.playing) schedule(now());
+    if (S.panel === 'levels') { clearTimeout(S.lvTimer); S.lvTimer = setTimeout(() => S.panel === 'levels' && renderLevelsPanel(), 300); }
   } catch (e) {
     console.warn('Could not load line', line.index, e);
   } finally {
@@ -309,11 +310,21 @@ function render() {
   if (v) {
     const regs = regions().map((r) => '<div class="vxe-region' + (uncovered(r) ? ' vxe-uncovered' : '') + '" style="left:' +
       tToX(r[0]) + 'px;width:' + Math.max(tToX(r[1] - r[0]), 2) + 'px" title="Speech in the video ' + fmt(r[0]) + ' – ' + fmt(r[1]) + '"></div>').join('');
-    html += '<div class="vxe-trackrow vxe-speech"><div class="vxe-head"><div class="vxe-head-name">🎙 Video speech</div>' +
+    const secs = sections().map((sec, i) => {
+      const cls = ['vxe-osec'];
+      if (S.selSec === i) cls.push('vxe-selected');
+      if (sec.sound === 'mute') cls.push('vxe-muted');
+      const label = sec.sound === 'mute' ? '🔇 Silent' : sec.sound === 'full' ? '🗣 Full original' : sec.sound === 'music' ? '🎵 Voices removed' : '';
+      const gain = sec.gain_db ? (sec.gain_db > 0 ? '+' : '') + sec.gain_db + ' dB' : '';
+      return '<div class="' + cls.join(' ') + '" data-osec="' + i + '" style="left:' + tToX(sec.start) + 'px;width:' +
+        Math.max(tToX(sec.end - sec.start), 2) + 'px" title="Original sound, part ' + (i + 1) + ': ' + fmt(sec.start) + ' – ' + fmt(sec.end) +
+        '"><span class="vxe-osec-label">' + esc([label, gain].filter(Boolean).join(' · ')) + '</span></div>';
+    }).join('');
+    html += '<div class="vxe-trackrow vxe-speech"><div class="vxe-head"><div class="vxe-head-name">🎞 Original sound</div>' +
       '<div class="vxe-head-tools"><button data-act="orig-mute" class="' + (originalOn() ? '' : 'vxe-on-m') +
-      '" title="Turn the original video\'s sound off / on (O)">M</button><button data-act="speech-panel" title="Speech detection settings">⚙ ' +
-      regions().length + ' found</button></div></div>' +
-      '<div class="vxe-lane" data-lane="speech" style="width:' + W + 'px"><canvas class="vxe-wave" data-role="speech-wave"></canvas>' + regs + '</div></div>';
+      '" title="Turn the original video\'s sound off / on (O)">M</button><button data-act="speech-panel" title="Speech found in the video: detection settings">⚙ ' +
+      regions().length + ' speech</button></div></div>' +
+      '<div class="vxe-lane" data-lane="speech" style="width:' + W + 'px"><canvas class="vxe-wave" data-role="speech-wave"></canvas>' + regs + secs + '</div></div>';
   }
   speakers().forEach((name) => {
     const own = S.lines.filter((l) => l.speaker === name);
@@ -418,7 +429,9 @@ function updateClipEl(key) {
 }
 
 function renderSelection() {
-  if (S.sel.size) S.selCue = null;
+  if (S.sel.size) { S.selCue = null; S.selSec = null; }
+  if (S.selCue) S.selSec = null;
+  content.querySelectorAll('[data-osec]').forEach((el) => el.classList.toggle('vxe-selected', +el.dataset.osec === S.selSec));
   content.querySelectorAll('[data-cue]').forEach((el) => el.classList.toggle('vxe-selected', el.dataset.cue === S.selCue));
   content.querySelectorAll('[data-clip]').forEach((el) => el.classList.toggle('vxe-selected', S.sel.has(el.dataset.clip)));
   const lines = selLines();
@@ -445,7 +458,7 @@ function setZoom(pps, anchorT, clientX) {
 }
 
 // ---------- edits, undo, save ----------
-const snapshot = () => JSON.stringify({ clips: S.clips, tracks: S.tracks, subs: S.subs });
+const snapshot = () => JSON.stringify({ clips: S.clips, tracks: S.tracks, subs: S.subs, secs: S.mix.orig_sections || null });
 function pushUndo(before) {
   S.undo.push(before || snapshot());
   if (S.undo.length > 200) S.undo.shift();
@@ -454,6 +467,8 @@ function pushUndo(before) {
 function restore(snap) {
   const s = JSON.parse(snap);
   S.clips = s.clips; S.tracks = s.tracks; S.subs = s.subs;
+  if (s.secs) S.mix.orig_sections = s.secs; else delete S.mix.orig_sections;
+  if (S.selSec != null && S.selSec >= sections().length) S.selSec = null;
   S.sel = new Set(selKeys());
   if (S.selCue && !cueById(S.selCue)) S.selCue = null;
   changed();
@@ -764,6 +779,14 @@ function startDrag(e, el) {
 content.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || e.target.closest('.vxe-head')) return;
   root.focus({ preventScroll: true });
+  const secEl = e.target.closest('[data-osec]');
+  if (secEl) {
+    // A part of the original sound: select it (it does not move: it has to stay in time with the picture).
+    seek(timeAtClientX(e.clientX));
+    S.selSec = +secEl.dataset.osec; S.sel.clear(); S.selCue = null; S.panel = null;
+    renderSelection();
+    return;
+  }
   const cueEl = e.target.closest('[data-cue]');
   if (cueEl) { startCueDrag(e, cueEl); return; }
   const el = e.target.closest('[data-clip]');
@@ -785,9 +808,10 @@ content.addEventListener('pointerdown', (e) => {
     const onUp = () => { lane.removeEventListener('pointermove', onMove); lane.removeEventListener('pointerup', onUp); };
     lane.addEventListener('pointermove', onMove);
     lane.addEventListener('pointerup', onUp);
-  } else if (!e.shiftKey && (S.sel.size || S.selCue)) {
+  } else if (!e.shiftKey && (S.sel.size || S.selCue || S.selSec != null)) {
     S.sel.clear();
     S.selCue = null;
+    S.selSec = null;
     renderSelection();
   }
 });
@@ -873,7 +897,9 @@ function toggleOriginal() {
   setStatus(originalOn() ? '🔊 The original video sound is on (' + q('mode').selectedOptions[0].text.toLowerCase() + ').'
     : '🔇 The original video sound is off — only the new voices play, in the preview and the export.');
 }
-function useMusic() { return S.mix.original === 'music' && !!music.getAttribute('src'); }
+function useMusic() {
+  return !!music.getAttribute('src') && (S.mix.original === 'music' || sections().some((x) => x.sound === 'music'));
+}
 function syncMusic(t, playing) {
   if (!useMusic()) { music.pause(); return; }
   if (Math.abs((music.currentTime || 0) - t) > 0.05) music.currentTime = t;
@@ -917,11 +943,36 @@ function schedule(t) {
   });
   syncMusic(t, true);
 }
-// "Level voices": every clip brought to the same speech loudness (as video_editor.speech_level / level_gain_db).
-const LEVEL_TARGET_DB = -20, LEVEL_RANGE_DB = 24;
+// "Level voices": every clip brought to the same loudness, as heard (as video_editor.speech_level / level_gain_db).
+const LEVEL_TARGET_DB = -20, LEVEL_RANGE_DB = 24, LEVEL_TARGET_MIN = -30, LEVEL_TARGET_MAX = -10;
+// How strongly a line is evened out from the inside (as video_editor.LEVEL_STRENGTHS): [ratio, most dB].
+const LEVEL_STRENGTHS = { off: [1, 0], light: [2, 6], normal: [3, 9], strong: [6, 12] };
 const levelOn = () => S.mix.level !== false;
+const levelTarget = () => clamp(S.mix.level_target != null ? +S.mix.level_target : LEVEL_TARGET_DB, LEVEL_TARGET_MIN, LEVEL_TARGET_MAX);
+const levelStrength = () => (S.mix.level_strength in LEVEL_STRENGTHS ? S.mix.level_strength : 'normal');
 const levelCache = {};
+function biquad(x, b, a) {
+  const y = new Float64Array(x.length), b0 = b[0] / a[0], b1 = b[1] / a[0], b2 = b[2] / a[0], a1 = a[1] / a[0], a2 = a[2] / a[0];
+  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  for (let i = 0; i < x.length; i++) {
+    const v = x[i], o = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1; x1 = v; y2 = y1; y1 = o; y[i] = o;
+  }
+  return y;
+}
+function kWeighted(data, sr) {
+  // The ITU-R BS.1770 "K" filter (as video_editor.k_weighted), so power follows how loud a voice sounds.
+  const A = Math.pow(10, 3.99984385397 / 40);
+  let w0 = 2 * Math.PI * 1681.9744509555319 / sr, cos = Math.cos(w0), alpha = Math.sin(w0) / (2 * 0.7071752369554193);
+  const root = 2 * Math.sqrt(A) * alpha;
+  const y = biquad(data,
+    [A * ((A + 1) + (A - 1) * cos + root), -2 * A * ((A - 1) + (A + 1) * cos), A * ((A + 1) + (A - 1) * cos - root)],
+    [(A + 1) - (A - 1) * cos + root, 2 * ((A - 1) - (A + 1) * cos), (A + 1) - (A - 1) * cos - root]);
+  w0 = 2 * Math.PI * 38.13547087613982 / sr; cos = Math.cos(w0); alpha = Math.sin(w0) / (2 * 0.5003270373253953);
+  return biquad(y, [(1 + cos) / 2, -(1 + cos), (1 + cos) / 2], [1 + alpha, -2 * cos, 1 - alpha]);
+}
 function speechLevel(data, sr, a, b) {
+  // data is already K-weighted.
   const n = Math.max(Math.round(sr * 0.05), 1), powers = [];
   for (let s = a; s + n <= b; s += n) {
     let sum = 0;
@@ -934,21 +985,24 @@ function speechLevel(data, sr, a, b) {
   return voiced.length ? 10 * Math.log10(voiced.reduce((x, y) => x + y, 0) / voiced.length) : null;
 }
 // Evening out a line from the inside (as video_editor.evening_curve): a gain in dB every EVEN_FRAME seconds.
-const EVEN_FRAME = 0.05, EVEN_WINDOW = 0.3, EVEN_RATIO = 3, EVEN_MAX_DB = 9;
+const EVEN_FRAME = 0.05, EVEN_WINDOW = 0.3;
 const curveCache = {};
 function eveningCurve(buf) {
-  if (curveCache[buf.__id]) return curveCache[buf.__id];
-  const sr = buf.sampleRate, data = buf.getChannelData(0);
+  buf.__id = buf.__id || ('b' + Math.random());
+  const strength = levelStrength(), id = buf.__id + '|' + strength;
+  if (curveCache[id]) return curveCache[id];
+  const [ratio, most] = LEVEL_STRENGTHS[strength];
+  const sr = buf.sampleRate, data = kWeighted(buf.getChannelData(0), sr);
   const hop = Math.max(Math.round(sr * EVEN_FRAME), 1), half = Math.max(Math.round(sr * EVEN_WINDOW / 2), 1);
   const count = Math.ceil(data.length / hop), line = speechLevel(data, sr, 0, data.length);
   const gains = new Float64Array(Math.max(count, 1));
-  if (count && line != null) {
+  if (count && line != null && most > 0) {
     const squares = new Float64Array(data.length + 1);
     for (let i = 0; i < data.length; i++) squares[i + 1] = squares[i] + data[i] * data[i];
     for (let i = 0; i < count; i++) {
       const c = Math.floor((i + 0.5) * hop), a = Math.max(c - half, 0), b = Math.min(c + half, data.length);
       const db = 10 * Math.log10((squares[b] - squares[a]) / Math.max(b - a, 1) + 1e-12);
-      if (db > Math.max(line - 20, -60)) gains[i] = clamp((line - db) * (1 - 1 / EVEN_RATIO), -EVEN_MAX_DB, EVEN_MAX_DB);
+      if (db > Math.max(line - 20, -60)) gains[i] = clamp((line - db) * (1 - 1 / ratio), -most, most);
     }
   }
   const smooth = new Float64Array(gains.length);  // over 0.25 s, so the volume glides
@@ -957,8 +1011,7 @@ function eveningCurve(buf) {
     for (let d = -2; d <= 2; d++) sum += gains[clamp(i + d, 0, gains.length - 1)];
     smooth[i] = sum / 5;
   }
-  buf.__id = buf.__id || ('b' + Math.random());
-  curveCache[buf.__id] = smooth;
+  curveCache[id] = smooth;
   return smooth;
 }
 function curveDbAt(curve, t) {
@@ -969,21 +1022,26 @@ function curveDbAt(curve, t) {
   const i = Math.floor(x);
   return curve[i] + (curve[i + 1] - curve[i]) * (x - i);
 }
-function autoGainDb(key) {
-  if (!levelOn()) return 0;
+function rawLevel(key) {
+  // How loud the clip's part sounds after evening out, before any gain (null: silent or not loaded).
   const l = lineOf(key), c = S.clips[key], buf = l && S.buffers[l.url];
-  if (!buf) return 0;
-  const id = l.url + '|' + (c.trim_in || 0) + '|' + (c.trim_out || 0);
+  if (!buf) return undefined;
+  buf.__id = buf.__id || ('b' + Math.random());
+  const id = buf.__id + '|' + (c.trim_in || 0) + '|' + (c.trim_out || 0) + '|' + levelStrength();
   if (!(id in levelCache)) {
     // Measured on the evened-out part, as the export does.
     const sr = buf.sampleRate, data = buf.getChannelData(0), curve = eveningCurve(buf);
     const a = Math.floor((c.trim_in || 0) * sr), b = Math.max(a, data.length - Math.floor((c.trim_out || 0) * sr));
     const part = new Float32Array(b - a);
     for (let i = a; i < b; i++) part[i - a] = data[i] * Math.pow(10, curveDbAt(curve, i / sr) / 20);
-    const level = speechLevel(part, sr, 0, part.length);
-    levelCache[id] = level == null ? 0 : clamp(LEVEL_TARGET_DB - level, -LEVEL_RANGE_DB, LEVEL_RANGE_DB);
+    levelCache[id] = speechLevel(kWeighted(part, sr), sr, 0, part.length);
   }
   return levelCache[id];
+}
+function autoGainDb(key) {
+  if (!levelOn()) return 0;
+  const level = rawLevel(key);
+  return level == null ? 0 : clamp(levelTarget() - level, -LEVEL_RANGE_DB, LEVEL_RANGE_DB);
 }
 function voiceBus(c) {
   // All voices go through a limiter, so levelled-up clips never clip (like the export's soft limiter).
@@ -1058,14 +1116,23 @@ function frame() {
     }
   }
   const vocalsOn = keys().some((k) => audible(k) && S.clips[k].start <= t && clipEnd(k) > t);
-  let level = clamp(dbg(S.mix.original_gain_db), 0, 1);
-  if (S.mix.original === 'duck' && vocalsOn) level *= dbg(DUCK_DB);
-  if (S.mix.original === 'replace' && replacedAt(t)) level = 0;
-  const mode = S.mix.original;
-  if (!originalOn()) { level = 0; music.pause(); }
-  video.muted = mode === 'mute' || useMusic() || !originalOn();
-  video.volume = level;
-  music.volume = level;
+  // The original sound: the part of it at t has its own volume and sound (as set / full original / voices removed / off).
+  const sec = sectionAt(t), mode = S.mix.original;
+  const base = clamp(dbg((S.mix.original_gain_db || 0) + (sec.gain_db || 0)), 0, 1);
+  const sound = !originalOn() ? 'mute' : sec.sound || 'auto';
+  let fromVideo = 0, fromMusic = 0;
+  if (sound === 'full') fromVideo = base;
+  else if (sound === 'music') fromMusic = base;
+  else if (sound === 'auto' && mode === 'music') fromMusic = base;
+  else if (sound === 'auto' && mode !== 'mute') {
+    fromVideo = base;
+    if (mode === 'duck' && vocalsOn) fromVideo *= dbg(DUCK_DB);
+    if (mode === 'replace' && replacedAt(t)) fromVideo = 0;
+  }
+  if (!originalOn()) music.pause();
+  video.muted = fromVideo <= 0;
+  video.volume = fromVideo;
+  music.volume = useMusic() ? fromMusic : 0;
   placeSubBox();
   requestAnimationFrame(frame);
 }
@@ -1088,6 +1155,8 @@ function renderInspector() {
   if (!S.data) { insp.innerHTML = '<div class="vxe-muted-note">Nothing loaded.</div>'; return; }
   if (S.panel === 'speech') return renderSpeechPanel();
   if (S.panel === 'subs') return renderSubsPanel();
+  if (S.panel === 'levels') return renderLevelsPanel();
+  if (S.selSec != null && sections()[S.selSec]) return renderSectionPanel(S.selSec);
   if (S.selCue && cueById(S.selCue)) return renderCuePanel(cueById(S.selCue));
   const sel = selKeys();
   if (sel.length === 1) return renderClipPanel(sel[0]);
@@ -1113,6 +1182,8 @@ function renderInspector() {
       field('Speech', regions().length + ' stretch(es) found' + (unc ? ' · <span style="color:var(--vxe-bad)">' + unc + ' without a new voice</span>' : '') +
         ' <button class="vxe-btn" data-act="speech-panel">⚙ Detection</button>')
       : field('Video', '<span class="vxe-muted-note">none yet — drop one on the left</span>')) +
+    field('Voice levels', (levelOn() ? '🎚 same loudness (' + levelTarget() + ' dB)' : '<span class="vxe-muted-note">off — each clip at its own loudness</span>') +
+      ' <button class="vxe-btn" data-act="levels-panel">⚙ Manage</button>') +
     (ov ? field('Overlaps', '<span style="color:var(--vxe-bad)">' + ov + ' clips overlap</span> <button class="vxe-btn" data-act="stack">↕ Stack</button> <button class="vxe-btn" data-act="spread">⇥ Remove</button>') : '') +
     '<div class="vxe-muted-note">Select a clip on the timeline to move it (left/right in time, up/down to another row), trim, cut, ' +
     'join, mute, edit its text or regenerate it. Lines marked ⚠ did not pass the voice check; a dashed outline is a line\'s subtitle time.</div>';
@@ -1140,7 +1211,8 @@ function renderClipPanel(key) {
         ((c.trim_in || c.trim_out) && pieces.length === 1 ? ' (trimmed) <button class="vxe-btn" data-act="untrim">Undo trim</button>' : '')) +
       field('Volume', '<input type="range" min="-20" max="12" step="1" data-f="gain_db" value="' + (c.gain_db || 0) + '"> <span data-role="gain-val">' + (c.gain_db || 0) + ' dB</span>' +
         (levelOn() && S.buffers[l.url] ? ' <span class="vxe-muted-note" title="Added by 🎚 Level voices so this clip is as loud as the others">· levelled ' +
-          (autoGainDb(key) >= 0 ? '+' : '') + autoGainDb(key).toFixed(1) + ' dB</span>' : '')) +
+          (autoGainDb(key) >= 0 ? '+' : '') + autoGainDb(key).toFixed(1) + ' dB</span>' : '') +
+        ' <button class="vxe-btn vxe-small" data-act="levels-panel" title="Loudness of every voice clip">🎚</button>') +
       field('Speed', '<input type="range" min="' + SPEED_MIN + '" max="' + SPEED_MAX + '" step="0.05" data-f="speed" value="' + speedOf(key) +
         '"> <span data-role="speed-val">' + speedLabel(speedOf(key)) + '</span> ' + speedButtons) +
       field('', '<label class="vxe-check"><input type="checkbox" data-f="muted"' + (c.muted ? ' checked' : '') + '> Muted (left out of the preview and export)</label>') +
@@ -1255,6 +1327,8 @@ function runAction(act) {
   }
   else if (act === 'speech-panel') { S.panel = 'speech'; renderInspector(); }
   else if (act === 'close-panel') { S.panel = null; renderInspector(); }
+  else if (act === 'levels-panel') { S.panel = 'levels'; S.sel.clear(); S.selCue = null; S.selSec = null; render(); renderInspector(); }
+  else if (act === 'lv-reset') resetClipVolumes();
   else if (act === 'detect') detectAgain();
   else return false;
   return true;
@@ -1766,6 +1840,174 @@ async function subtitleImages() {
   return out;
 }
 
+// ---------- the original sound as parts (cut, volume, sound per part) ----------
+const SECTION_SOUNDS = [['auto', 'As set in the toolbar'], ['full', 'Full original (its voices too)'],
+  ['music', 'Voices removed (music & effects)'], ['mute', 'Silent']];
+S.selSec = null;
+function videoLength() { return (S.data && S.data.video && S.data.video.duration) || (isFinite(video.duration) ? video.duration : 0) || S.dur; }
+function sections() {
+  const list = S.mix.orig_sections;
+  if (list && list.length) return list;
+  return [{ start: 0, end: r3(videoLength()), gain_db: 0, sound: 'auto' }];
+}
+function ownSections() {
+  // The parts as their own list (made the first time one is changed).
+  if (!S.mix.orig_sections || !S.mix.orig_sections.length) S.mix.orig_sections = sections().map((x) => Object.assign({}, x));
+  const list = S.mix.orig_sections, end = r3(videoLength());
+  if (list.length && list[list.length - 1].end < end) list[list.length - 1].end = end;
+  return list;
+}
+function sectionAt(t) { return sections().find((x) => x.start <= t && t < x.end) || { gain_db: 0, sound: 'auto' }; }
+function cutSection(t) {
+  const list = ownSections(), i = list.findIndex((x) => x.start + 0.05 < t && t < x.end - 0.05);
+  if (i < 0) { setStatus('✂ Put the playhead inside the part of the original sound to cut it there.'); return; }
+  pushUndo();
+  const right = Object.assign({}, list[i], { start: r3(t) });
+  list[i].end = r3(t);
+  list.splice(i + 1, 0, right);
+  S.selSec = i + 1;
+  changed();
+  setStatus('✂ Cut the original sound at ' + fmt(t) + ' — each part has its own volume and sound (click a part to change it).');
+}
+function joinSection(i) {
+  const list = ownSections();
+  if (i >= list.length - 1) { setStatus('🔗 This is the last part — select the part before the one to join.'); return; }
+  pushUndo();
+  list[i].end = list[i + 1].end;
+  list.splice(i + 1, 1);
+  if (list.length === 1 && !list[0].gain_db && list[0].sound === 'auto') delete S.mix.orig_sections;
+  S.selSec = i;
+  changed();
+}
+function muteSection(i) {
+  const list = ownSections(), x = list[i];
+  pushUndo();
+  if (x.sound === 'mute') { x.sound = x.before || 'auto'; delete x.before; } else { x.before = x.sound; x.sound = 'mute'; }
+  changed();
+}
+function renderSectionPanel(i) {
+  const list = sections(), x = list[i];
+  insp.innerHTML = '<h3>🎞 Original sound — part ' + (i + 1) + ' of ' + list.length + '</h3>' +
+    field('Time', fmt(x.start) + ' – ' + fmt(x.end) + ' (' + (x.end - x.start).toFixed(2) + ' s)') +
+    field('Sound', '<select data-of="sound">' + SECTION_SOUNDS.map(([v, label]) => '<option value="' + v + '"' + ((x.sound || 'auto') === v ? ' selected' : '') + '>' + label + '</option>').join('') + '</select>') +
+    field('Volume', '<input type="range" min="-30" max="12" step="1" data-of="gain_db" value="' + (x.gain_db || 0) + '"> <span data-role="sec-gain">' + (x.gain_db || 0) + ' dB</span>') +
+    '<div class="vxe-actions"><button class="vxe-btn" data-act="sec-play">▶ Play</button>' +
+    '<button class="vxe-btn" data-act="sec-cut" title="C">✂ Cut at playhead</button>' +
+    '<button class="vxe-btn" data-act="sec-join" title="J"' + (i >= list.length - 1 ? ' disabled' : '') + '>🔗 Join with the next part</button>' +
+    '<button class="vxe-btn" data-act="sec-mute" title="M">' + (x.sound === 'mute' ? '🔊 Unmute' : '🔇 Silence this part') + '</button>' +
+    '<button class="vxe-btn" data-act="sec-reset">↺ Back to normal</button></div>' +
+    '<div class="vxe-muted-note">Cut the original sound into parts to treat them differently: e.g. keep a real scream from the ' +
+    'original (Full original), take the voices out of one scene (Voices removed), or make a part quieter. Parts do not move — ' +
+    'they stay in time with the picture. The toolbar\'s Original audio and Orig dB still apply to every part.</div>';
+}
+insp.addEventListener('input', (e) => {
+  if (e.target.dataset.of !== 'gain_db' || S.selSec == null) return;
+  if (!S.pendingUndo) S.pendingUndo = snapshot();
+  ownSections()[S.selSec].gain_db = +e.target.value;
+  insp.querySelector('[data-role="sec-gain"]').textContent = e.target.value + ' dB';
+});
+insp.addEventListener('change', (e) => {
+  const of = e.target.dataset.of;
+  if (!of || S.selSec == null) return;
+  if (of === 'gain_db') { pushUndo(S.pendingUndo); S.pendingUndo = null; changed(); return; }
+  pushUndo();
+  ownSections()[S.selSec].sound = e.target.value;
+  changed();
+  if (e.target.value === 'music' && !music.getAttribute('src')) separateVoices();
+});
+insp.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-act]');
+  if (!b || !b.dataset.act.startsWith('sec-') || S.selSec == null) return;
+  const act = b.dataset.act, x = sections()[S.selSec];
+  if (act === 'sec-play') { seek(x.start); play(); }
+  else if (act === 'sec-cut') cutSection(now());
+  else if (act === 'sec-join') joinSection(S.selSec);
+  else if (act === 'sec-mute') muteSection(S.selSec);
+  else if (act === 'sec-reset') { pushUndo(); Object.assign(ownSections()[S.selSec], { gain_db: 0, sound: 'auto' }); changed(); }
+});
+
+// ---------- 🎚 Voice levels: one place to keep every voice clip equally loud ----------
+const STRENGTH_LABELS = [['off', 'Off — keep each line as it was spoken'], ['light', 'Light'], ['normal', 'Normal'],
+  ['strong', 'Strong — every word about as loud as the next']];
+function clipLoudness(key) {
+  // How loud the clip plays (dB, as heard), with levelling and its own Volume; null if silent, undefined if not loaded.
+  const level = rawLevel(key);
+  if (level == null) return level;
+  return level + autoGainDb(key) + (S.clips[key].gain_db || 0);
+}
+function renderLevelsPanel() {
+  const on = levelOn(), target = levelTarget(), list = keys().filter((k) => lineOf(k) && lineOf(k).url && !S.clips[k].muted)
+    .sort((a, b) => S.clips[a].start - S.clips[b].start);
+  const rows = list.map((k) => ({ k, l: lineOf(k), db: clipLoudness(k), own: S.clips[k].gain_db || 0 }));
+  const known = rows.filter((r) => r.db != null);
+  const lo = known.length ? Math.min(...known.map((r) => r.db)) : 0, hi = known.length ? Math.max(...known.map((r) => r.db)) : 0;
+  const mid = on ? target : (known.length ? known.map((r) => r.db).sort((a, b) => a - b)[Math.floor(known.length / 2)] : 0);
+  const tweaked = rows.filter((r) => r.own).length;
+  const off = rows.filter((r) => r.db != null && Math.abs(r.db - mid) > 1.5);
+  const bar = (db) => {
+    const x = clamp(50 + (db - mid) * 5, 2, 98);
+    return '<span class="vxe-lv-bar"><span class="vxe-lv-mid"></span><span class="vxe-lv-dot" style="left:' + x + '%"></span></span>';
+  };
+  insp.innerHTML = '<h3>🎚 Voice levels</h3>' +
+    '<div class="vxe-muted-note">Keeps every voice clip just as loud as the others — measured the way loudness is heard, ' +
+    'so a deep voice and a bright shout come out even. It follows your edits (trim, cut, speed, regenerate) and applies to the preview and the export.</div>' +
+    field('', '<label class="vxe-check"><input type="checkbox" data-lv="on"' + (on ? ' checked' : '') + '> Level voices (same loudness for every clip)</label>') +
+    field('Loudness', '<input type="range" min="' + LEVEL_TARGET_MIN + '" max="' + LEVEL_TARGET_MAX + '" step="1" data-lv="target" value="' + target + '"' + (on ? '' : ' disabled') +
+      '> <span data-role="lv-target">' + target + ' dB</span> <span class="vxe-muted-note">how loud every voice is</span>') +
+    field('Inside a line', '<select data-lv="strength"' + (on ? '' : ' disabled') + '>' + STRENGTH_LABELS.map(([v, label]) =>
+      '<option value="' + v + '"' + (levelStrength() === v ? ' selected' : '') + '>' + label + '</option>').join('') + '</select>' +
+      ' <span class="vxe-muted-note">evens out loud and quiet words within each line</span>') +
+    field('Now', known.length ? (hi - lo <= 1.5 ? '<span style="color:#6fdc8c">✔ all ' + known.length + ' clips within ' + (hi - lo).toFixed(1) + ' dB of each other</span>'
+      : '<span style="color:var(--vxe-warn)">' + known.length + ' clips span ' + (hi - lo).toFixed(1) + ' dB · ' + off.length + ' stand out</span>')
+      : '<span class="vxe-muted-note">loading the voices…</span>') +
+    field('Clip volumes', tweaked ? tweaked + ' clip(s) have their own Volume change on top <button class="vxe-btn" data-act="lv-reset">↺ Reset all to 0 dB</button>'
+      : '<span class="vxe-muted-note">no clip has its own Volume change</span>') +
+    '<div class="vxe-lv-list">' + rows.map((r) => '<div class="vxe-lv-row' + (r.db != null && Math.abs(r.db - mid) > 1.5 ? ' vxe-lv-out' : '') +
+      '" data-lvkey="' + esc(r.k) + '" title="Click to select this clip">' +
+      '<span class="vxe-dot" style="background:' + colorOf(r.l.speaker) + '"></span><span class="vxe-lv-name">#' + r.l.index + ' ' + esc(r.l.speaker) + '</span>' +
+      (r.db == null ? '<span class="vxe-muted-note">' + (r.db === null ? 'silent' : '…') + '</span>'
+        : bar(r.db) + '<span class="vxe-lv-db">' + (r.db - mid >= 0 ? '+' : '') + (r.db - mid).toFixed(1) + ' dB</span>') +
+      (r.own ? '<span class="vxe-badge" title="This clip\'s own Volume">' + (r.own > 0 ? '+' : '') + r.own + ' dB</span>' : '') + '</div>').join('') + '</div>' +
+    '<div class="vxe-muted-note">Each row shows how much louder (+) or quieter (−) a clip plays than ' + (on ? 'the chosen loudness' : 'the middle clip') +
+    '. Click a row to select the clip and change its own Volume.</div>' +
+    '<div class="vxe-actions"><button class="vxe-btn" data-act="close-panel">Close</button></div>';
+}
+function setLevel(change) {
+  Object.assign(S.mix, change);
+  showLevelButton();
+  changed(true);
+  if (S.panel === 'levels') renderLevelsPanel();
+}
+function resetClipVolumes() {
+  const list = keys().filter((k) => S.clips[k].gain_db);
+  if (!list.length) return;
+  pushUndo();
+  list.forEach((k) => { S.clips[k].gain_db = 0; });
+  changed();
+  setStatus('🎚 ' + list.length + ' clip(s) set back to 0 dB — every voice now plays at the same loudness.');
+}
+insp.addEventListener('input', (e) => {
+  if (e.target.dataset.lv !== 'target') return;
+  const v = insp.querySelector('[data-role="lv-target"]');
+  if (v) v.textContent = e.target.value + ' dB';
+});
+insp.addEventListener('change', (e) => {
+  const lv = e.target.dataset.lv;
+  if (lv === 'on') setLevel({ level: e.target.checked });
+  else if (lv === 'target') setLevel({ level_target: +e.target.value });
+  else if (lv === 'strength') setLevel({ level_strength: e.target.value });
+});
+insp.addEventListener('click', (e) => {
+  const row = e.target.closest('[data-lvkey]');
+  if (!row) return;
+  const k = row.dataset.lvkey, c = S.clips[k];
+  if (!c) return;
+  S.panel = null; S.selCue = null; S.selSec = null; S.sel = new Set([k]);
+  seek(c.start);
+  scroll.scrollLeft = Math.max(0, c.start * S.pps + HEAD - scroll.clientWidth / 3);
+  render(); renderInspector();
+});
+
 // ---------- full screen ----------
 const isFull = () => document.fullscreenElement === root || root.classList.contains('vxe-max');
 function toggleFullscreen() {
@@ -1891,8 +2133,11 @@ document.addEventListener('keydown', (e) => {
   else if (key === 'ArrowLeft' || key === 'ArrowRight') seek(now() + (key === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 5 : 1));
   else if (key === 'ArrowUp') stepClip(-1);
   else if (key === 'ArrowDown') stepClip(1);
+  else if ((key === 'c' || key === 'b') && S.selSec != null) cutSection(now());
   else if (key === 'c' || key === 'b') cutAt(now(), sel.length ? sel : null);
+  else if (key === 'j' && S.selSec != null) joinSection(S.selSec);
   else if (key === 'j') joinPieces(selKeys());
+  else if ((key === 'm' || key === 'Delete' || key === 'Backspace') && S.selSec != null) muteSection(S.selSec);
   else if ((key === '[' || key === ']') && sel.length) stepSpeed(sel, key === '[' ? -0.05 : 0.05);
   else if ((key === 'Delete' || key === 'Backspace') && S.selCue) deleteCue(S.selCue);
   else if ((key === 'Delete' || key === 'Backspace') && sel.length) deletePieces(sel);
@@ -1905,7 +2150,7 @@ document.addEventListener('keydown', (e) => {
   else if (key === 'Escape' && root.classList.contains('vxe-max')) toggleFullscreen();
   else if (key === 'Home') seek(0);
   else if (key === 'End') seek(S.dur);
-  else if (key === 'Escape') { S.sel.clear(); S.selCue = null; renderSelection(); }
+  else if (key === 'Escape') { S.sel.clear(); S.selCue = null; S.selSec = null; renderSelection(); }
   else handled = false;
   if (handled) e.preventDefault();
 });

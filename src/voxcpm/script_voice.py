@@ -60,7 +60,7 @@ VOICE_DESCRIPTIONS = {
     ("male", "adult"): "Adult man's voice, clearly masculine, deep and resonant, low pitch",
     ("female", "adult"): "Adult woman's voice, clearly feminine, warm and clear, medium-high pitch",
     ("unknown", "adult"): "Natural adult voice",
-    ("male", "kid"): "Young boy's voice, a child of about eight, high and bright",
+    ("male", "kid"): "Young boy of about ten, clearly a boy, boyish and energetic, slightly husky, not girlish",
     ("female", "kid"): "Young girl's voice, a child of about eight, high and bright",
     ("unknown", "kid"): "Young child's voice, a child of about eight, high and bright",
 }
@@ -70,7 +70,7 @@ PITCH_RANGES = {
     ("male", "adult"): (90.0, 140.0),
     ("female", "adult"): (185.0, 255.0),
     ("unknown", "adult"): (85.0, 255.0),
-    ("male", "kid"): (200.0, 380.0),
+    ("male", "kid"): (195.0, 280.0),  # a boy at the high end sounds like a girl: kept lower
     ("female", "kid"): (220.0, 400.0),
     ("unknown", "kid"): (200.0, 400.0),
 }
@@ -480,9 +480,9 @@ class ScriptVoicer(VideoDubber):
         only = None if only is None else {int(i) for i in only}
         state = {"refs": {}, "entries": {}, "rounds": {}, "voice_rounds": {}}
         if only is not None:
-            if not state_path.exists():
-                raise ValueError("Generate all lines first; then failed lines can be regenerated.")
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            # Some lines only (one speaker's, failed ones, …): on top of what was made before, if anything.
+            if state_path.exists():
+                state = json.loads(state_path.read_text(encoding="utf-8"))
             state.setdefault("voice_rounds", {})
             missing = only - {l.index for l in lines}
             if missing:
@@ -499,7 +499,8 @@ class ScriptVoicer(VideoDubber):
             if n in profiles and n not in new_voices and Path(path).exists()
         }
         for name, profile in profiles.items():
-            if profile.reference_wav and name not in new_voices:
+            if profile.reference_wav:
+                # A voice template (or your own clip): every line copies it; "new voice" redoes their lines with it.
                 refs[name] = profile.reference_wav
             elif name not in refs and name in firsts and (only is None or any(
                 l.speaker == name and l.index in only for l in lines
@@ -535,7 +536,10 @@ class ScriptVoicer(VideoDubber):
                 if emb is not None:
                     accepted.setdefault(line.speaker, []).append(emb)
 
-        todo = [l for l in lines if only is None or l.index in only]
+        # Speaker by speaker (the one with the most lines first), each in time order: one voice at a time.
+        counts = Counter(l.speaker for l in lines)
+        rank = {name: i for i, name in enumerate(sorted(counts, key=lambda n: (-counts[n], firsts[n].start)))}
+        todo = sorted((l for l in lines if only is None or l.index in only), key=lambda l: (rank[l.speaker], l.start))
         for step, line in enumerate(todo):
             if progress:
                 progress(step, len(todo), line)
@@ -544,7 +548,7 @@ class ScriptVoicer(VideoDubber):
             if reference is None:
                 mode = "design"
             elif profile.reference_wav:
-                mode = "clone (your reference)"
+                mode = "clone (voice template)"
             else:
                 mode = f"clone→#{firsts[line.speaker].index} (neutral)"
 
@@ -617,13 +621,14 @@ class ScriptVoicer(VideoDubber):
         # Combined track: lines keep their natural pace (sped up by at most ``max_speedup``, default 1.1 here,
         # which is inaudible); a line that is still too long pushes the following lines a little later
         # instead of being squeezed, since squeezing changes how the voice sounds.
-        clips, report = [], []
+        clips, report, waiting = [], [], []
         cursor = 0.0
         for line in lines:
             raw = raw_dir / f"{line.index:04d}.wav"
             entry = state["entries"].get(str(line.index))
             if entry is None or not raw.exists():
-                raise ValueError(f"Line #{line.index} has not been generated yet; generate all lines first.")
+                waiting.append(line)  # not made yet (e.g. only one speaker was generated): left out of the track
+                continue
             wav, _ = sf.read(str(raw), dtype="float32")
             fitted, rate = fit_to_slot(wav, sr, slot=line.duration, available=1e9, max_speedup=options.max_speedup)
             start = max(line.start, cursor)
@@ -647,6 +652,14 @@ class ScriptVoicer(VideoDubber):
                     "style": line_style(line),
                     "text": line.text,
                 }
+            )
+        if not report:
+            raise ValueError("No line has been generated yet.")
+        if waiting:
+            names = sorted({l.speaker for l in waiting})
+            self.warnings.append(
+                f"{len(waiting)} line(s) are not generated yet ({', '.join(names)}), so the combined track has only "
+                "the lines made so far. Generate them to complete it."
             )
         total = max(cursor, max(l.end for l in lines)) + 0.5
         shifted = [r for r in report if r["shift_s"] > 0.05]
@@ -742,18 +755,282 @@ def failed_lines(report: list[dict]) -> list[int]:
     return [r["index"] for r in report if not r.get("voice_ok", True) or not r.get("gender_ok", True)]
 
 
+# -----------------------------
+# Voice templates
+# -----------------------------
+
+AUTO_VOICE = "auto"  # no template: the voice is designed from the speaker's first line(s)
+VOICE_LIBRARY_DIR = Path(os.environ.get("VOXCPM_VOICES_DIR", Path.home() / ".voxcpm" / "voices"))
+# What a template says (calm and neutral, about 6 s): "Hello, I am glad to meet you today. Let's start our story
+# together." Every line of a speaker copies the voice of this clip and adds its own emotion.
+TEMPLATE_TEXT = "សួស្តី ខ្ញុំរីករាយណាស់ដែលបានជួបអ្នកនៅថ្ងៃនេះ។ តោះយើងចាប់ផ្តើមរឿងរបស់យើងទាំងអស់គ្នា។"
+# Written as casting notes for voice actors, so the templates sound like film dubbing, not like ordinary speech.
+STARTER_VOICES = [
+    {"name": "Man", "gender": "male", "age": "adult",
+     "description": "Professional male voice actor for film dubbing, adult man, deep, rich and resonant, clear diction, "
+                    "natural and expressive"},
+    {"name": "Woman", "gender": "female", "age": "adult",
+     "description": "Professional female voice actor for film dubbing, adult woman, warm, smooth and expressive, clear "
+                    "diction, clearly feminine"},
+    {"name": "Young man", "gender": "male", "age": "adult",
+     "description": "Young male voice actor in his twenties for film dubbing, clear and bright, confident, clearly "
+                    "masculine, natural and expressive"},
+    {"name": "Young woman", "gender": "female", "age": "adult",
+     "description": "Young female voice actor in her twenties for film dubbing, bright, sweet and lively, clear diction, "
+                    "clearly feminine, medium-high pitch"},
+    {"name": "Old man", "gender": "male", "age": "adult",
+     "description": "Veteran male voice actor playing an elderly man of about seventy, deep and low, gravelly, slow "
+                    "and weighty, clearly masculine, not high-pitched"},
+    {"name": "Old woman", "gender": "female", "age": "adult",
+     "description": "Veteran female voice actor playing an elderly woman of about seventy, soft, slightly raspy, gentle "
+                    "and slow, clearly feminine"},
+    {"name": "Boy", "gender": "male", "age": "kid",
+     "description": "Child voice actor, a boy of about ten, clearly a boy, boyish and energetic, slightly husky, not "
+                    "girlish, clear diction"},
+    {"name": "Girl", "gender": "female", "age": "kid",
+     "description": "Child voice actress, a girl of about ten, sweet, bright and lively, clearly a girl, clear diction"},
+    {"name": "Kid", "gender": "unknown", "age": "kid",
+     "description": "Child voice actor of about eight, bright, playful and clear"},
+    {"name": "Narrator", "gender": "unknown", "age": "adult",
+     "description": "Professional narrator for film trailers and documentaries, warm, rich, calm and authoritative, "
+                    "clear diction"},
+]
+
+
+def _library(directory=None) -> Path:
+    return Path(directory) if directory else VOICE_LIBRARY_DIR
+
+
+def load_voice_library(directory=None) -> dict[str, dict]:
+    """The voice templates: ``{name: {"path", "gender", "age", "description", "starter"}}`` (missing clips left out)."""
+    index = _library(directory) / "voices.json"
+    try:
+        data = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {n: dict(v, path=str(_library(directory) / v["file"])) for n, v in data.items()
+            if (_library(directory) / v.get("file", "")).exists()}
+
+
+def save_voice_template(
+    name: str, wav_path: str | os.PathLike, gender: str = "unknown", age: str = "adult", description: str = "",
+    starter: bool = False, directory=None,
+) -> dict:
+    """Keep a clip in the voice library as the template ``name`` (replacing one of that name)."""
+    import shutil
+
+    name = str(name).strip()
+    if not name or name.lower() == AUTO_VOICE:
+        raise ValueError("Give the voice a name.")
+    folder = _library(directory)
+    folder.mkdir(parents=True, exist_ok=True)
+    index = folder / "voices.json"
+    try:
+        data = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    slug = re.sub(r"[^\w-]+", "_", name)[:40] or "voice"
+    file = f"{slug}.wav"
+    if name not in data and any(v.get("file") == file for v in data.values()):
+        file = f"{slug}_{len(data)}.wav"
+    shutil.copyfile(wav_path, folder / file)
+    data[name] = {"file": file, "gender": gender, "age": age, "description": description, "starter": bool(starter)}
+    pitch = template_pitch({"path": str(folder / file)})  # kept, so matching speakers to templates is quick
+    if pitch:
+        data[name]["pitch_hz"] = round(pitch, 1)
+    index.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return dict(data[name], path=str(folder / file))
+
+
+def delete_voice_template(name: str, directory=None) -> None:
+    folder = _library(directory)
+    index = folder / "voices.json"
+    data = json.loads(index.read_text(encoding="utf-8")) if index.exists() else {}
+    entry = data.pop(name, None)
+    if entry:
+        (folder / entry["file"]).unlink(missing_ok=True)
+        index.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def template_voice(name: str, directory=None) -> Optional[dict]:
+    """The template called ``name`` (``None`` for "auto" or an empty name); an unknown name is an error."""
+    name = str(name or "").strip()
+    if not name or name.lower() == AUTO_VOICE:
+        return None
+    library = load_voice_library(directory)
+    if name not in library:
+        raise ValueError(f"There is no voice template called {name!r} (make it under 🎙 Voice templates).")
+    return library[name]
+
+
+def gender_lean(embedding: np.ndarray, males: list[np.ndarray], females: list[np.ndarray]) -> float:
+    """How much more a voice sounds like the men than like the women (speaker-embedding similarity, -1..1)."""
+    unit = embedding / (np.linalg.norm(embedding) + 1e-9)
+    best = lambda refs: max(float(unit @ (r / (np.linalg.norm(r) + 1e-9))) for r in refs)
+    return best(males) - best(females)
+
+
+def make_voice_template(
+    voicer: "ScriptVoicer", name: str, gender: str, age: str, description: str, seed: int = 0,
+    options: Optional[DubOptions] = None, starter: bool = False, directory=None, text: str = TEMPLATE_TEXT,
+    candidates: int = 1, gender_refs: Optional[dict[str, list[np.ndarray]]] = None, embed=None,
+) -> dict:
+    """Design a voice from its description (a calm reading of :data:`TEMPLATE_TEXT`, retried until its pitch fits
+    the gender and age) and keep it in the library. The same name, description and seed give the same voice.
+
+    With ``candidates`` > 1, ``gender_refs`` (``{"male": [...], "female": [...]}`` speaker embeddings, e.g. of the
+    adult templates) and ``embed`` (path -> embedding), several versions are made and the one that sounds most like
+    its gender is kept - a boy's voice is as high as a girl's, so pitch alone can not tell them apart."""
+    import shutil
+    import tempfile
+
+    profile = SpeakerProfile(name=name, gender=gender, age=age, voice_mode="clone_first",
+                             description=description or voice_description(gender, age))
+    line = SubtitleLine(index=1, start=0.0, end=6.0, text=text, speaker=name, gender=gender, emotion="calm and neutral")
+    judge = gender in ("male", "female") and candidates > 1 and embed and gender_refs \
+        and gender_refs.get("male") and gender_refs.get("female")
+    best_path, best_score, scores = None, None, []
+    with tempfile.TemporaryDirectory() as tmp:
+        for k in range(max(candidates if judge else 1, 1)):
+            # Far apart: each version's own retries step by 7919, and must not run into the next version's seeds.
+            path = voicer.speaker_voice(profile, [line], replace(options or DubOptions(), seed=seed + 1_000_003 * k))
+            if not path:
+                continue
+            kept = str(Path(tmp) / f"candidate_{k}.wav")
+            shutil.copyfile(path, kept)
+            score = 0.0
+            if judge:
+                emb = embed(kept)
+                if emb is not None:
+                    lean = gender_lean(emb, gender_refs["male"], gender_refs["female"])
+                    score = lean if gender == "male" else -lean
+            scores.append(round(score, 3))
+            if best_score is None or score > best_score:
+                best_path, best_score = kept, score
+        if not best_path:
+            raise RuntimeError(f"The voice {name!r} came out too short; try again or change its description.")
+        made = save_voice_template(name, best_path, gender, age, profile.description, starter=starter, directory=directory)
+    made["candidate_scores"] = scores
+    return made
+
+
+# The usual template for a gender and age (by starter name), when nothing else tells the speakers apart.
+_DEFAULT_TEMPLATE = {
+    ("male", "adult"): "Man", ("female", "adult"): "Woman", ("male", "kid"): "Boy", ("female", "kid"): "Girl",
+    ("unknown", "kid"): "Kid", ("unknown", "adult"): "Narrator",
+}
+_OLD_WORDS = ("old", "elder", "grand", "aged", "senior", "chief", "ចាស់", "តា", "យាយ")
+_YOUNG_WORDS = ("young", "teen", "youth", "boyish", "girlish", "ក្មេង")
+
+
+def template_pitch(template: dict) -> Optional[float]:
+    """Median pitch (Hz) of a template's clip (kept in the template once measured)."""
+    if template.get("pitch_hz"):
+        return float(template["pitch_hz"])
+    import soundfile as sf
+
+    from .dubbing import median_pitch
+
+    try:
+        wav, sr = sf.read(template["path"], dtype="float32")
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        return median_pitch(wav, sr)
+    except Exception:
+        return None
+
+
+def speaker_pitches(lines: list[SubtitleLine], audio: np.ndarray, sr: int, max_lines: int = 12) -> dict[str, float]:
+    """Each speaker's median pitch in the original video (from up to ``max_lines`` of their longest lines)."""
+    from .dubbing import _segment, median_pitch
+
+    found: dict[str, float] = {}
+    for name in dict.fromkeys(l.speaker for l in lines):
+        own = sorted((l for l in lines if l.speaker == name), key=lambda l: -l.duration)[:max_lines]
+        clip = np.concatenate([_segment(audio, sr, l.start, l.end) for l in own] or [np.zeros(0, np.float32)])
+        f0 = median_pitch(clip.astype(np.float32), sr) if len(clip) > sr // 2 else None
+        if f0:
+            found[name] = f0
+    return found
+
+
+def match_templates(
+    profiles: dict[str, SpeakerProfile],
+    library: dict[str, dict],
+    line_counts: Optional[dict[str, int]] = None,
+    pitches: Optional[dict[str, float]] = None,
+) -> dict[str, str]:
+    """The template that fits each speaker best: one of their gender and age; an old / young / narrator one when
+    their name or description says so; the closest in pitch to their voice in the original video (``pitches``);
+    and, where there is a choice, a different one for each speaker (the speakers with the most lines choose first)."""
+    if not library:
+        return {}
+    import math
+
+    t_pitch = {n: template_pitch(t) for n, t in library.items()}
+    used: dict[str, int] = {}
+    chosen: dict[str, str] = {}
+    order = sorted(profiles, key=lambda n: -(line_counts or {}).get(n, 0))
+    for name in order:
+        p = profiles[name]
+        words = f"{name} {p.description or ''}".lower()
+        old, young = any(w in words for w in _OLD_WORDS), any(w in words for w in _YOUNG_WORDS)
+        narrator = "narrat" in words
+
+        def score(t_name: str) -> float:
+            t = library[t_name]
+            t_words = f"{t_name} {t.get('description', '')}".lower()
+            cost = 0.0
+            if p.gender in ("male", "female") and t["gender"] in ("male", "female") and t["gender"] != p.gender:
+                cost += 100
+            if p.gender in ("male", "female") and t["gender"] == "unknown":
+                cost += 8
+            if (p.age or "adult") != t.get("age", "adult"):
+                cost += 50
+            t_old = any(w in t_words for w in ("old", "elder"))
+            t_young = "young" in t_words
+            cost += -10 if old and t_old else 6 if t_old else 0
+            cost += -6 if young and t_young else 0
+            if narrator and "narrat" in t_words:
+                cost -= 20
+            elif "narrat" in t_words:
+                cost += 4
+            f_s, f_t = (pitches or {}).get(name), t_pitch.get(t_name)
+            if f_s and f_t:
+                cost += 1.5 * abs(12 * math.log2(f_t / f_s))  # semitones away from how they really sound
+            elif _DEFAULT_TEMPLATE.get((p.gender, p.age or "adult")) == t_name:
+                cost -= 3
+            return cost + 12 * used.get(t_name, 0)  # two speakers sharing a voice only when nothing else fits
+
+        best = min(library, key=lambda t_name: (score(t_name), t_name))
+        chosen[name] = best
+        used[best] = used.get(best, 0) + 1
+    return chosen
+
+
 def speaker_summary(lines: list[SubtitleLine], profiles: dict[str, SpeakerProfile]) -> list[list]:
-    """``[name, gender, age, voice description, number of lines]`` rows."""
+    """``[name, gender, age, voice description, number of lines, voice template]`` rows ("auto": designed from the
+    speaker's first line)."""
     counts = Counter(l.speaker for l in lines)
-    return [[p.name, p.gender, p.age, p.description, counts.get(p.name, 0)] for p in profiles.values()]
+    return [[p.name, p.gender, p.age, p.description, counts.get(p.name, 0), AUTO_VOICE] for p in profiles.values()]
 
 
 __all__ = [
+    "AUTO_VOICE",
     "DEFAULT_SPEAKER",
+    "STARTER_VOICES",
     "ScriptResult",
     "ScriptVoicer",
     "VoiceTag",
     "apply_tones",
+    "delete_voice_template",
+    "load_voice_library",
+    "gender_lean",
+    "make_voice_template",
+    "match_templates",
+    "speaker_pitches",
+    "save_voice_template",
+    "template_voice",
     "failed_lines",
     "generated_lines",
     "load_results",

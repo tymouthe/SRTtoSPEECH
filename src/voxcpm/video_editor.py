@@ -448,13 +448,59 @@ def _encoders(codec: Optional[str]) -> list[list[str]]:
 
 
 LEVEL_TARGET_DB = -20.0  # where "Level voices" puts every clip (speech level, see speech_level)
+LEVEL_TARGET_RANGE = (-30.0, -10.0)  # the loudness the editor lets you choose
 LEVEL_RANGE_DB = 24.0  # it never turns a clip up or down by more than this
+# How strongly a line is evened out from the inside: (ratio, most dB a word is turned up or down).
+LEVEL_STRENGTHS = {"off": (1.0, 0.0), "light": (2.0, 6.0), "normal": (3.0, 9.0), "strong": (6.0, 12.0)}
 
 
-def speech_level(wav: np.ndarray, sr: int, frame: float = 0.05) -> Optional[float]:
-    """How loud the speech in ``wav`` is, in dB: the mean power of its 50 ms frames that are within 30 dB of its
-    loudest one, so pauses and quiet tails do not count. ``None`` for silence. (The editor measures the same way.)"""
-    wav = np.asarray(wav, dtype=np.float64)
+def level_options(level) -> Optional[dict]:
+    """``{"target": dB, "strength": name}`` for "Level voices", or ``None`` when it is off. ``level`` is ``True`` /
+    ``False`` or such a dict (missing keys take the defaults; the editor saves ``mix.level_target`` and
+    ``mix.level_strength``)."""
+    if not level and not isinstance(level, dict):  # {} means "on, with the defaults"
+        return None
+    opts = level if isinstance(level, dict) else {}
+    try:
+        target = float(opts.get("target", LEVEL_TARGET_DB))
+    except (TypeError, ValueError):
+        target = LEVEL_TARGET_DB
+    strength = opts.get("strength") if opts.get("strength") in LEVEL_STRENGTHS else "normal"
+    return {"target": float(np.clip(target, *LEVEL_TARGET_RANGE)), "strength": strength}
+
+
+def _biquad(b, a, x: np.ndarray) -> np.ndarray:
+    from scipy.signal import lfilter
+
+    return lfilter(np.asarray(b) / a[0], np.asarray(a) / a[0], x)
+
+
+def k_weighted(wav: np.ndarray, sr: int) -> np.ndarray:
+    """``wav`` through the ITU-R BS.1770 "K" filter (a +4 dB lift above ~1.7 kHz and a cut below ~38 Hz), so its
+    power follows how loud it sounds: a deep voice is not counted louder than it sounds, nor a bright shout quieter.
+    (The editor filters the same way.)"""
+    x = np.asarray(wav, dtype=np.float64)
+    if not len(x):
+        return x
+    A = 10 ** (3.99984385397 / 40)
+    w0 = 2 * np.pi * 1681.9744509555319 / sr
+    cos, alpha = np.cos(w0), np.sin(w0) / (2 * 0.7071752369554193)
+    root = 2 * np.sqrt(A) * alpha
+    x = _biquad(
+        [A * ((A + 1) + (A - 1) * cos + root), -2 * A * ((A - 1) + (A + 1) * cos), A * ((A + 1) + (A - 1) * cos - root)],
+        [(A + 1) - (A - 1) * cos + root, 2 * ((A - 1) - (A + 1) * cos), (A + 1) - (A - 1) * cos - root],
+        x,
+    )
+    w0 = 2 * np.pi * 38.13547087613982 / sr
+    cos, alpha = np.cos(w0), np.sin(w0) / (2 * 0.5003270373253953)
+    return _biquad([(1 + cos) / 2, -(1 + cos), (1 + cos) / 2], [1 + alpha, -2 * cos, 1 - alpha], x)
+
+
+def speech_level(wav: np.ndarray, sr: int, frame: float = 0.05, weighted: bool = True) -> Optional[float]:
+    """How loud the speech in ``wav`` sounds, in dB: the mean power (after :func:`k_weighted`, unless
+    ``weighted=False``) of its 50 ms frames that are within 30 dB of its loudest one, so pauses and quiet tails do
+    not count. ``None`` for silence. (The editor measures the same way.)"""
+    wav = k_weighted(wav, sr) if weighted else np.asarray(wav, dtype=np.float64)
     n = max(int(sr * frame), 1)
     count = len(wav) // n
     if count == 0:
@@ -470,38 +516,39 @@ def speech_level(wav: np.ndarray, sr: int, frame: float = 0.05) -> Optional[floa
 
 EVEN_FRAME = 0.05  # seconds between points of the evening-out curve
 EVEN_WINDOW = 0.3  # each point looks at this much audio around it
-EVEN_RATIO = 3.0  # words 9 dB louder than the line end up 3 dB louder
+EVEN_RATIO = 3.0  # "normal": words 9 dB louder than the line end up 3 dB louder
 EVEN_MAX_DB = 9.0
 
 
-def evening_curve(wav: np.ndarray, sr: int) -> np.ndarray:
-    """Gain in dB every :data:`EVEN_FRAME` s that evens out a line from the inside: words louder than the line's
-    speech level are turned down and quieter ones up (ratio :data:`EVEN_RATIO`, at most ±:data:`EVEN_MAX_DB`);
+def evening_curve(wav: np.ndarray, sr: int, strength: str = "normal") -> np.ndarray:
+    """Gain in dB every :data:`EVEN_FRAME` s that evens out a line from the inside: words that sound louder than the
+    line's speech level are turned down and quieter ones up (ratio and limit from :data:`LEVEL_STRENGTHS`);
     silence and breaths are left alone. Point ``i`` is at ``(i + 0.5) * EVEN_FRAME`` s. (The editor computes the
     same curve, so the preview sounds like the export.)"""
-    wav = np.asarray(wav, dtype=np.float64)
+    ratio, most = LEVEL_STRENGTHS.get(strength, LEVEL_STRENGTHS["normal"])
+    weighted = k_weighted(wav, sr)
     hop, half = max(int(round(sr * EVEN_FRAME)), 1), max(int(round(sr * EVEN_WINDOW / 2)), 1)
-    count = int(np.ceil(len(wav) / hop))
-    line = speech_level(wav, sr)
-    if not count or line is None:
+    count = int(np.ceil(len(weighted) / hop))
+    line = speech_level(weighted, sr, weighted=False)
+    if not count or line is None or most <= 0:
         return np.zeros(max(count, 1))
-    squares = np.concatenate([[0.0], np.cumsum(wav * wav)])
+    squares = np.concatenate([[0.0], np.cumsum(weighted * weighted)])
     gains = np.zeros(count)
     for i in range(count):
         c = int((i + 0.5) * hop)
-        a, b = max(c - half, 0), min(c + half, len(wav))
+        a, b = max(c - half, 0), min(c + half, len(weighted))
         power = (squares[b] - squares[a]) / max(b - a, 1)
         db = 10 * np.log10(power + 1e-12)
         if db > max(line - 20.0, -60.0):
-            gains[i] = np.clip((line - db) * (1 - 1 / EVEN_RATIO), -EVEN_MAX_DB, EVEN_MAX_DB)
+            gains[i] = np.clip((line - db) * (1 - 1 / ratio), -most, most)
     k = 5  # smooth over 0.25 s so the volume glides
     padded = np.concatenate([np.full(k // 2, gains[0]), gains, np.full(k // 2, gains[-1])])
     return np.convolve(padded, np.ones(k) / k, mode="valid")
 
 
-def even_out(wav: np.ndarray, sr: int) -> np.ndarray:
+def even_out(wav: np.ndarray, sr: int, strength: str = "normal") -> np.ndarray:
     """``wav`` with :func:`evening_curve` applied."""
-    curve = evening_curve(wav, sr)
+    curve = evening_curve(wav, sr, strength)
     times = (np.arange(len(curve)) + 0.5) * EVEN_FRAME
     gain_db = np.interp(np.arange(len(wav)) / sr, times, curve)
     return (np.asarray(wav, dtype=np.float32) * (10 ** (gain_db / 20)).astype(np.float32)).astype(np.float32)
@@ -525,20 +572,33 @@ def soft_limit(wav: np.ndarray, knee: float = 0.8) -> np.ndarray:
     return out
 
 
-def clip_audio(wav: np.ndarray, sr: int, clip: dict, level: bool = False) -> np.ndarray:
+def clip_audio(wav: np.ndarray, sr: int, clip: dict, level=False) -> np.ndarray:
     """The part of a line's audio the clip keeps (after trimming), at the clip's speed and volume.
 
     ``trim_in`` / ``trim_out`` are seconds of the line's own audio; at speed 2 the clip lasts half as long. With
-    ``level`` ("Level voices"), the line is first evened out from the inside (:func:`even_out`) and the part is
-    brought to :data:`LEVEL_TARGET_DB`, so every clip is as loud as the others, word for word; the clip's own volume
-    is then a change on top of that."""
+    ``level`` ("Level voices": ``True`` or :func:`level_options` settings), the line is first evened out from the
+    inside (:func:`even_out`) and the part is brought to the target loudness, so every clip sounds as loud as the
+    others, word for word; the clip's own volume is then a change on top of that."""
+    opts = level_options(level)
     a = int(round(max(float(clip.get("trim_in") or 0), 0) * sr))
     b = len(wav) - int(round(max(float(clip.get("trim_out") or 0), 0) * sr))
-    source = even_out(wav, sr) if level else np.asarray(wav, dtype=np.float32)
+    source = even_out(wav, sr, opts["strength"]) if opts else np.asarray(wav, dtype=np.float32)
     part = change_speed(source[a:max(b, a)], sr, clip_speed(clip))
-    gain = float(clip.get("gain_db") or 0) + (level_gain_db(part, sr) if level else 0.0)
+    gain = float(clip.get("gain_db") or 0) + (level_gain_db(part, sr, opts["target"]) if opts else 0.0)
     part = part * np.float32(10 ** (gain / 20))
-    return soft_limit(part) if level else part
+    return soft_limit(part) if opts else part
+
+
+SECTION_SOUNDS = ("auto", "full", "music", "mute")  # as set for the whole video / full original / voices removed / silent
+
+
+def _fit(wav: Optional[np.ndarray], n: int) -> Optional[np.ndarray]:
+    if wav is None:
+        return None
+    out = np.zeros(n, dtype=np.float32)
+    m = min(n, len(wav))
+    out[:m] = np.asarray(wav[:m], dtype=np.float32)
+    return out
 
 
 def render_mix(
@@ -551,11 +611,20 @@ def render_mix(
     vocals_gain_db: float = 0.0,
     duck_db: float = -15.0,
     regions: Optional[list] = None,
-    level: bool = False,
+    level=False,
+    sections: Optional[list[dict]] = None,
+    full: Optional[np.ndarray] = None,
+    music: Optional[np.ndarray] = None,
+    fade: float = 0.02,
 ) -> np.ndarray:
     """One soundtrack: every unmuted clip at its place, over the original soundtrack (kept, ducked under the
     clips, silenced where they replace it, or left out). For ``mode="music"`` pass the soundtrack without voices
-    as ``original``; for ``mode="replace"`` pass the speech found in the video as ``regions``."""
+    as ``original``; for ``mode="replace"`` pass the speech found in the video as ``regions``.
+
+    ``sections`` (``[{"start", "end", "gain_db", "sound"}]``, the original sound cut into parts in the editor) give
+    each part of the original its own volume and sound: ``auto`` (as above), ``full`` (the whole original soundtrack,
+    voices too - pass it as ``full``), ``music`` (voices removed - pass ``music``) or ``mute``. Parts meet with
+    short ``fade`` s crossfades."""
     vocals_gain = np.float32(10 ** (vocals_gain_db / 20))
     placed, spans = [], []
     for clip, wav in clips:
@@ -568,13 +637,35 @@ def render_mix(
     background = None
     if original is not None and mode != "mute":
         background = np.asarray(original, dtype=np.float32) * np.float32(10 ** (original_gain_db / 20))
+    duck_spans, bg_mode = spans, "duck" if mode in ("duck", "replace") else "mute" if mode == "mute" else "keep"
     if mode == "replace":
-        spans, duck_db = replaced_spans(spans, regions), SILENT_DB
-    return mix_timeline(
-        placed, total_seconds, sr, background=background,
-        background_mode="duck" if mode in ("duck", "replace") else "mute" if mode == "mute" else "keep",
-        duck_db=duck_db, speech_regions=spans,
-    )
+        duck_spans, duck_db = replaced_spans(spans, regions), SILENT_DB
+    if not sections:
+        return mix_timeline(placed, total_seconds, sr, background=background, background_mode=bg_mode,
+                            duck_db=duck_db, speech_regions=duck_spans)
+    n = int(round(total_seconds * sr))
+    gain = np.float32(10 ** (original_gain_db / 20))
+    sources = {
+        "auto": mix_timeline([], total_seconds, sr, background=background, background_mode=bg_mode, duck_db=duck_db,
+                             speech_regions=duck_spans) if background is not None else None,
+        "full": None if full is None else _fit(full, n) * gain,
+        "music": None if music is None else _fit(music, n) * gain,
+    }
+    weights = {k: np.zeros(n, dtype=np.float32) for k in sources}
+    for sec in sections:
+        sound = sec.get("sound") or "auto"
+        if sound not in weights:
+            continue  # "mute": nothing
+        a, b = max(int(float(sec["start"]) * sr), 0), min(int(float(sec["end"]) * sr), n)
+        if b > a:
+            weights[sound][a:b] = 10 ** (float(sec.get("gain_db") or 0) / 20)
+    k = max(int(fade * sr), 1)
+    bg = np.zeros(n, dtype=np.float32)
+    for name, src in sources.items():
+        if src is not None and weights[name].any():
+            w = np.convolve(weights[name], np.ones(k, dtype=np.float32) / k, mode="same")
+            bg += _fit(src, n) * w
+    return mix_timeline(placed, total_seconds, sr, background=bg, background_mode="keep")
 
 
 def read_soundtrack(media_path: str, sr: int, out_wav: str | Path) -> np.ndarray:
@@ -662,12 +753,15 @@ def has_ffmpeg() -> bool:
 
 __all__ = [
     "ORIGINAL_MODES",
+    "SECTION_SOUNDS",
     "replaced_spans",
     "align_to_speech",
     "clip_audio",
     "even_out",
     "evening_curve",
     "level_gain_db",
+    "level_options",
+    "k_weighted",
     "speech_level",
     "change_speed",
     "clip_line",

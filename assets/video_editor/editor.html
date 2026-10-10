@@ -63,6 +63,7 @@
       </select>
       <span class="vxe-label">Orig dB</span><input type="range" min="-30" max="6" step="1" value="0" data-role="orig-gain" title="Original audio volume">
       <button class="vxe-btn" data-act="level" data-role="level" title="Keep every voice clip at the same loudness, also after you trim, cut, speed up or regenerate it (a clip's Volume is a change on top)">🎚 Level voices: on</button>
+      <button class="vxe-btn" data-act="levels-panel" title="Manage the loudness of every voice clip: how loud, how even, and which clips stand out">⚙ Levels</button>
       <span class="vxe-label">Voices dB</span><input type="range" min="-20" max="12" step="1" value="0" data-role="voc-gain" title="Volume of all new voices">
     </div>
     <div class="vxe-group" data-role="subs-group">
@@ -92,6 +93,6 @@
     double-click to play it · ←/→ nudge 0.05 s (Shift: 0.5 s) · Alt+↑/↓ row up/down · C cut at the playhead · Alt+click cut there ·
     J join pieces back · [ / ] slower / faster · Delete removes a piece · M mute · S align to detected speech · R regenerate · Space play/pause ·
     Ctrl/⌘+wheel zoom · Alt while dragging = no snapping · F full screen (Esc to leave) · O original sound on / off · N new subtitle at the playhead; double-click the 💬 Subtitles track to add one there, drag a subtitle or its edges to change its time (up/down for another row — a higher row is drawn above), Delete removes it.
-    Grey blocks on the <b>Video speech</b> track are where someone speaks in the video; red ones have no new voice over them.
+    Grey blocks on the <b>🎞 Original sound</b> track are where someone speaks in the video (red: no new voice over them); click the track to select a part of the original sound, C cuts it at the playhead, then give each part its own volume and sound (e.g. keep a real scream).
   </div>
 </div>

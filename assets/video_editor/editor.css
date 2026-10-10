@@ -180,3 +180,24 @@
 .vxe-cue.vxe-selected { box-shadow: 0 0 0 2px #fff, 0 0 10px rgba(255, 255, 255, .35); z-index: 2; }
 .vxe-cue.vxe-empty { background: repeating-linear-gradient(-45deg, #e2c15a, #e2c15a 6px, #cfae4a 6px, #cfae4a 12px); }
 .vxe-subcanvas { position: absolute; display: none; pointer-events: none; z-index: 3; }
+
+/* Parts of the original sound, over its waveform. */
+.vxe-osec { position: absolute; top: 2px; bottom: 2px; border-left: 1px solid rgba(255, 255, 255, .25); cursor: pointer; }
+.vxe-osec:first-of-type { border-left: none; }
+.vxe-osec:hover { background: rgba(255, 255, 255, .05); }
+.vxe-osec.vxe-selected { box-shadow: inset 0 0 0 2px #fff; background: rgba(255, 255, 255, .06); }
+.vxe-osec.vxe-muted { background: repeating-linear-gradient(-45deg, rgba(0,0,0,.45), rgba(0,0,0,.45) 6px, rgba(0,0,0,.25) 6px, rgba(0,0,0,.25) 12px); }
+.vxe-osec-label { position: absolute; left: 4px; top: 2px; font-size: 10.5px; color: #fff; text-shadow: 0 1px 2px #000; white-space: nowrap; pointer-events: none; }
+
+/* 🎚 Voice levels panel */
+.vxe-lv-list { max-height: 260px; overflow-y: auto; margin: 6px 0; border: 1px solid var(--vxe-line, #333); border-radius: 6px; }
+.vxe-lv-row { display: flex; align-items: center; gap: 8px; padding: 3px 8px; cursor: pointer; font-size: 12px; }
+.vxe-lv-row:hover { background: var(--vxe-panel2); }
+.vxe-lv-row.vxe-lv-out .vxe-lv-db { color: var(--vxe-warn); font-weight: 600; }
+.vxe-lv-name { flex: 0 0 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vxe-lv-bar { position: relative; flex: 1 1 auto; height: 6px; min-width: 60px; background: var(--vxe-panel2); border-radius: 3px; }
+.vxe-lv-mid { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--vxe-dim); }
+.vxe-lv-dot { position: absolute; top: -2px; width: 10px; height: 10px; margin-left: -5px; border-radius: 50%; background: var(--vxe-accent); }
+.vxe-lv-out .vxe-lv-dot { background: var(--vxe-warn); }
+.vxe-lv-db { flex: 0 0 64px; text-align: right; font-variant-numeric: tabular-nums; }
+.vxe-btn.vxe-small { padding: 0 6px; font-size: 12px; }
