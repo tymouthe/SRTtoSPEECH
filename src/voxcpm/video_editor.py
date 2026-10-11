@@ -413,9 +413,13 @@ def _even(v: float) -> int:
     return max(int(round(v / 2)) * 2, 2)
 
 
-def subtitle_filter(mode: str, box: list[float], width: int, height: int) -> Optional[str]:
+def subtitle_filter(
+    mode: str, box: list[float], width: int, height: int, start: Optional[float] = None, end: Optional[float] = None,
+    src: str = "0:v", out: str = "v", tag: str = "",
+) -> Optional[str]:
     """The ffmpeg filter that hides ``box`` (fractions of the picture): ``blur`` softens it until the text is
-    unreadable, ``fill`` paints it over from the pixels around it (delogo)."""
+    unreadable, ``fill`` paints it over from the pixels around it (delogo). With ``start`` / ``end`` (seconds)
+    only during that time; ``src`` / ``out`` are its input and output labels, ``tag`` keeps its inner labels apart."""
     if mode not in ("blur", "fill") or not box:
         return None
     x, y, w, h = box
@@ -423,11 +427,28 @@ def subtitle_filter(mode: str, box: list[float], width: int, height: int) -> Opt
     pw, ph = _even(w * width), _even(h * height)
     px, py = min(max(px, 2), width - 4), min(max(py, 2), height - 4)
     pw, ph = min(pw, width - px - 2), min(ph, height - py - 2)
+    when = f":enable='between(t,{start:.3f},{end:.3f})'" if start is not None and end is not None else ""
     if mode == "fill":
-        return f"[0:v]delogo=x={px}:y={py}:w={pw}:h={ph}[v]"
+        return f"[{src}]delogo=x={px}:y={py}:w={pw}:h={ph}{when}[{out}]"
     sigma = max(8, ph // 3)
-    return (f"[0:v]split=2[base][cut];[cut]crop={pw}:{ph}:{px}:{py},gblur=sigma={sigma}:steps=3[soft];"
-            f"[base][soft]overlay={px}:{py}[v]")
+    return (f"[{src}]split=2[base{tag}][cut{tag}];[cut{tag}]crop={pw}:{ph}:{px}:{py},gblur=sigma={sigma}:steps=3[soft{tag}];"
+            f"[base{tag}][soft{tag}]overlay={px}:{py}{when}[{out}]")
+
+
+def subtitle_parts(subtitles: Optional[dict]) -> list[dict]:
+    """The parts of the video where the subtitles burned into it are hidden (the 🌫 Blur track):
+    ``[{"start", "end", "box", "mode"}]`` (``end`` None: to the end). ``subtitles`` is ``{"mode", "box", "parts"}``:
+    ``mode`` "off" keeps them all; a project from before the track (no ``parts``) hides ``box`` all the time."""
+    if not subtitles or subtitles.get("mode") not in ("blur", "fill"):
+        return []
+    parts = subtitles.get("parts")
+    if parts is None:
+        return [{"start": 0.0, "end": None, "box": subtitles["box"], "mode": subtitles["mode"]}] if subtitles.get("box") else []
+    return [
+        {"start": float(p["start"]), "end": float(p["end"]), "box": p["box"], "mode": p.get("mode") or subtitles["mode"]}
+        for p in parts
+        if p.get("box") and (p.get("mode") or subtitles["mode"]) in ("blur", "fill") and float(p["end"]) > float(p["start"])
+    ]
 
 
 def _encoders(codec: Optional[str]) -> list[list[str]]:
@@ -701,17 +722,21 @@ def export_video(
     overlays: Optional[list[tuple[float, float, int, int, str]]] = None,
 ) -> str:
     """The video with ``audio_path`` as its soundtrack. The picture is copied as it is, unless ``subtitles``
-    (``{"mode": "blur" | "fill", "box": [x, y, w, h]}``) asks to hide the subtitles burned into it, or ``overlays``
+    (``{"mode": "blur" | "fill", "box": [x, y, w, h], "parts": [...]}``, see :func:`subtitle_parts`) asks to hide
+    the subtitles burned into it, or ``overlays``
     (see :func:`subtitle_overlays`) draws new ones: then it is re-encoded at the original size, codec and frame
     rate, at a quality that keeps it practically identical."""
     out_path = str(out_path)
     info = probe_video(video_path)
     graph, label = [], "0:v"
-    if subtitles and subtitles.get("mode") in ("blur", "fill") and subtitles.get("box"):
-        cleanup = subtitle_filter(subtitles["mode"], subtitles["box"], info["width"], info["height"])
+    for i, part in enumerate(subtitle_parts(subtitles)):
+        timed = part["end"] is not None
+        cleanup = subtitle_filter(part["mode"], part["box"], info["width"], info["height"],
+                                  part["start"] if timed else None, part["end"] if timed else None,
+                                  src=label, out=f"clean{i}", tag=str(i))
         if cleanup:
-            graph.append(cleanup.replace("[v]", "[clean]"))
-            label = "clean"
+            graph.append(cleanup)
+            label = f"clean{i}"
     inputs = []
     if overlays:
         inputs, drawn, label = subtitle_overlays(label, overlays)
@@ -772,6 +797,7 @@ __all__ = [
     "detect_subtitle_box",
     "ensure_subtitle_box",
     "find_subtitle_box",
+    "subtitle_parts",
     "subtitle_filter",
     "subtitle_overlays",
     "export_video",

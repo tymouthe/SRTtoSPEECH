@@ -482,3 +482,55 @@ def test_make_voice_template_keeps_the_version_that_sounds_most_like_its_gender(
     scores = made["candidate_scores"]
     assert len(scores) == 3 and scores.index(max(scores)) == 1  # the boyish one is kept
     assert script_voice.gender_lean(np.array([0.9, 0.3]), [male], [female]) > 0
+
+
+def test_make_voice_template_keeps_the_clearest_version_not_a_muffled_or_boxy_one(tmp_path):
+    sr = _StubModel.tts_model.sample_rate
+    t = np.arange(int(1.5 * sr)) / sr
+    muffled = (0.3 * np.sin(2 * np.pi * 180 * t)).astype(np.float32)
+    boxy = (muffled + 0.2 * np.sin(2 * np.pi * 2500 * t)).astype(np.float32)  # strong presence, nothing above 6 kHz
+    clear = (boxy + 0.01 * np.sin(2 * np.pi * 8000 * t)).astype(np.float32)
+    versions = iter([muffled, clear, boxy])
+
+    class Model(_StubModel):
+        def generate(self, **kwargs):
+            self.calls.append(kwargs)
+            return next(versions)
+
+    voicer = script_voice.ScriptVoicer(Model(), tmp_path / "make")
+    opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1, first_line_attempts=1)
+    made = script_voice.make_voice_template(voicer, "Narrator", "unknown", "adult", "calm", options=opts,
+                                            directory=tmp_path / "voices", candidates=3)
+    clarity = made["candidate_clarity"]
+    assert len(clarity) == 3 and clarity[1] > clarity[2] + 10 and clarity[1] > clarity[0] + 10
+    import soundfile as sf
+
+    kept, kept_sr = sf.read(made["path"], dtype="float32")
+    assert script_voice.voice_clarity(kept, kept_sr) == pytest.approx(clarity[1], abs=0.5)  # the clear one is kept
+
+
+def test_made_templates_are_copied_without_denoising_but_uploaded_clips_are_denoised(tmp_path):
+    library = tmp_path / "voices"
+    clip = tmp_path / "clip.wav"
+    import soundfile as sf
+
+    sf.write(clip, _tone(200, 1.5, 16000), 16000)
+    made = script_voice.save_voice_template("Made", clip, directory=library, description="warm woman")
+    uploaded = script_voice.save_voice_template("Mine", clip, directory=library,
+                                                description=script_voice.UPLOADED_DESCRIPTION)
+
+    class Denoiser:
+        def __init__(self):
+            self.seen = []
+
+        def enhance(self, path, output_path):
+            self.seen.append(Path(path).name)
+            Path(output_path).write_bytes(Path(path).read_bytes())
+
+    model = _StubModel()
+    model.denoiser = Denoiser()
+    voicer = script_voice.ScriptVoicer(model, tmp_path / "work")
+    opts = dubbing.DubOptions()
+    assert voicer._prepared_reference(made["path"], opts) == made["path"]
+    assert voicer._prepared_reference(uploaded["path"], opts).endswith("_denoised.wav")
+    assert model.denoiser.seen == [Path(uploaded["path"]).name]

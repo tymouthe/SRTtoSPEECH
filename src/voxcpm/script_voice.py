@@ -394,6 +394,19 @@ class ScriptResult:
 class ScriptVoicer(VideoDubber):
     """Voices SRT lines with one consistent, designed voice per speaker (no video or original audio)."""
 
+    def _prepared_reference(self, path: Optional[str], options: DubOptions) -> Optional[str]:
+        """A voice template made by VoxCPM is copied as it is: it has no noise to remove, and the denoiser's
+        16 kHz output would cut everything above 8 kHz and make every line muffled. Uploaded clips are denoised."""
+        if path:
+            try:
+                library = json.loads((Path(path).parent / "voices.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                library = {}
+            entry = next((v for v in library.values() if v.get("file") == Path(path).name), None)
+            if entry and entry.get("description") != UPLOADED_DESCRIPTION:
+                return path
+        return super()._prepared_reference(path, options)
+
     def speaker_voice(
         self, profile: SpeakerProfile, own: list[SubtitleLine], options: DubOptions, min_seconds: float = 4.0
     ) -> Optional[str]:
@@ -760,6 +773,7 @@ def failed_lines(report: list[dict]) -> list[int]:
 # -----------------------------
 
 AUTO_VOICE = "auto"  # no template: the voice is designed from the speaker's first line(s)
+UPLOADED_DESCRIPTION = "Uploaded clip"  # a recording, not made by VoxCPM: denoised before it is copied
 VOICE_LIBRARY_DIR = Path(os.environ.get("VOXCPM_VOICES_DIR", Path.home() / ".voxcpm" / "voices"))
 # What a template says (calm and neutral, about 6 s): "Hello, I am glad to meet you today. Let's start our story
 # together." Every line of a speaker copies the voice of this clip and adds its own emotion.
@@ -870,6 +884,28 @@ def gender_lean(embedding: np.ndarray, males: list[np.ndarray], females: list[np
     return best(males) - best(females)
 
 
+def voice_clarity(wav: np.ndarray, sr: int) -> float:
+    """How clear and easy to listen to a voice sounds (higher is better, at most -7).
+
+    Presence: the share (dB) of its 70 Hz-6 kHz energy at 1-6 kHz, where consonants are - a muffled voice (all
+    low hum) has e.g. -30, a crisp one -5; above -7 counts no more (only harsher). Air: the share of its 70 Hz-12 kHz
+    energy at 6-12 kHz - VoxCPM sometimes makes a take with nothing above 4-6 kHz, which sounds boxy and honky like a
+    phone line however strong its presence; each dB below -35 counts against it."""
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    power = np.abs(np.fft.rfft(wav)) ** 2
+    freqs = np.fft.rfftfreq(len(wav), 1.0 / sr)
+
+    def share(low, high, total_high):
+        total = power[(freqs >= 70) & (freqs < total_high)].sum()
+        part = power[(freqs >= low) & (freqs < high)].sum()
+        return float(10 * np.log10(part / total + 1e-12)) if total > 0 else -120.0
+
+    presence, air = share(1000, 6000, 6000), share(6000, 12000, 12000)
+    return min(presence, -7.0) + min(air + 35.0, 0.0)
+
+
 def make_voice_template(
     voicer: "ScriptVoicer", name: str, gender: str, age: str, description: str, seed: int = 0,
     options: Optional[DubOptions] = None, starter: bool = False, directory=None, text: str = TEMPLATE_TEXT,
@@ -878,20 +914,25 @@ def make_voice_template(
     """Design a voice from its description (a calm reading of :data:`TEMPLATE_TEXT`, retried until its pitch fits
     the gender and age) and keep it in the library. The same name, description and seed give the same voice.
 
-    With ``candidates`` > 1, ``gender_refs`` (``{"male": [...], "female": [...]}`` speaker embeddings, e.g. of the
-    adult templates) and ``embed`` (path -> embedding), several versions are made and the one that sounds most like
-    its gender is kept - a boy's voice is as high as a girl's, so pitch alone can not tell them apart."""
+    With ``candidates`` > 1 several versions are made and the clearest is kept (see :func:`voice_clarity`): every
+    line of a speaker copies the template, so a muffled template makes all their lines muffled, and how clear a
+    version comes out depends far more on its seed than on the description or the number of steps. With
+    ``gender_refs`` (``{"male": [...], "female": [...]}`` speaker embeddings, e.g. of the adult templates) and
+    ``embed`` (path -> embedding) only the versions that sound most like their gender compete - a boy's voice is as
+    high as a girl's, so pitch alone can not tell them apart."""
     import shutil
     import tempfile
+
+    import soundfile as sf
 
     profile = SpeakerProfile(name=name, gender=gender, age=age, voice_mode="clone_first",
                              description=description or voice_description(gender, age))
     line = SubtitleLine(index=1, start=0.0, end=6.0, text=text, speaker=name, gender=gender, emotion="calm and neutral")
     judge = gender in ("male", "female") and candidates > 1 and embed and gender_refs \
         and gender_refs.get("male") and gender_refs.get("female")
-    best_path, best_score, scores = None, None, []
+    made_versions, scores, clarity = [], [], []
     with tempfile.TemporaryDirectory() as tmp:
-        for k in range(max(candidates if judge else 1, 1)):
+        for k in range(max(candidates, 1)):
             # Far apart: each version's own retries step by 7919, and must not run into the next version's seeds.
             path = voicer.speaker_voice(profile, [line], replace(options or DubOptions(), seed=seed + 1_000_003 * k))
             if not path:
@@ -904,13 +945,19 @@ def make_voice_template(
                 if emb is not None:
                     lean = gender_lean(emb, gender_refs["male"], gender_refs["female"])
                     score = lean if gender == "male" else -lean
+            wav, sr = sf.read(kept, dtype="float32")
             scores.append(round(score, 3))
-            if best_score is None or score > best_score:
-                best_path, best_score = kept, score
-        if not best_path:
+            clarity.append(round(voice_clarity(wav, sr), 1))
+            made_versions.append(kept)
+        if not made_versions:
             raise RuntimeError(f"The voice {name!r} came out too short; try again or change its description.")
-        made = save_voice_template(name, best_path, gender, age, profile.description, starter=starter, directory=directory)
+        # The clearest of the versions that clearly sound like their gender (or nearly as much as the best one).
+        eligible = [i for i, s in enumerate(scores) if s >= min(max(scores) - 0.05, 0.1)]
+        best = max(eligible, key=lambda i: clarity[i])
+        made = save_voice_template(name, made_versions[best], gender, age, profile.description, starter=starter,
+                                   directory=directory)
     made["candidate_scores"] = scores
+    made["candidate_clarity"] = clarity
     return made
 
 

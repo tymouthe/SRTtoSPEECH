@@ -346,3 +346,45 @@ def test_original_sound_sections_have_their_own_volume_and_sound():
     assert abs(mixed[7600]) < 1e-6  # silent
     no_sections = video_editor.render_mix(clips, 8.0, sr, original=original, mode="replace", regions=regions)
     assert abs(no_sections[5500] - 0.5) < 1e-3  # without sections: as before
+
+
+def test_subtitle_parts_come_from_the_blur_track():
+    assert video_editor.subtitle_parts({"mode": "off", "box": [0, 0, 1, 1], "parts": [{"start": 0, "end": 1, "box": [0, 0, 1, 1]}]}) == []
+    # A project from before the blur track: the whole video.
+    assert video_editor.subtitle_parts({"mode": "fill", "box": [0.1, 0.7, 0.8, 0.1]}) == [
+        {"start": 0.0, "end": None, "box": [0.1, 0.7, 0.8, 0.1], "mode": "fill"}]
+    parts = video_editor.subtitle_parts({"mode": "blur", "box": [0, 0, 1, 1], "parts": [
+        {"start": 1, "end": 2, "box": [0.1, 0.7, 0.8, 0.1], "mode": "fill"},
+        {"start": 3, "end": 3, "box": [0.1, 0.7, 0.8, 0.1]},  # empty: left out
+        {"start": 4, "end": 5, "box": [0.2, 0.1, 0.5, 0.1]},  # no mode of its own: the track's
+    ]})
+    assert [(p["start"], p["end"], p["mode"]) for p in parts] == [(1.0, 2.0, "fill"), (4.0, 5.0, "blur")]
+    timed = video_editor.subtitle_filter("blur", [0.1, 0.7, 0.8, 0.1], 1080, 1920, 1.0, 2.5, src="a", out="b", tag="3")
+    assert timed.startswith("[a]split=2[base3][cut3]") and timed.endswith(":enable='between(t,1.000,2.500)'[b]")
+
+
+def test_export_hides_each_blur_part_only_during_its_time(tmp_path):
+    import shutil
+    import subprocess
+
+    import pytest
+    import soundfile as sf
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg is not installed")
+    src = tmp_path / "in.mp4"
+    # A thin white "subtitle" on black, for 3 s.
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "color=black:size=360x640:rate=25,drawbox=x=176:y=500:w=8:h=40:color=white:t=fill", "-t", "3",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)], check=True)
+    sf.write(str(tmp_path / "a.wav"), np.zeros(3 * 16000, dtype=np.float32), 16000)
+    out = video_editor.export_video(str(src), str(tmp_path / "a.wav"), tmp_path / "out.mp4", subtitles={
+        "mode": "blur", "box": [0.1, 0.75, 0.8, 0.08],
+        "parts": [{"start": 1.0, "end": 2.0, "box": [0.3, 0.7, 0.4, 0.2], "mode": "blur"}]})
+
+    def pixel(t):
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(t), "-i", str(out), "-frames:v", "1", "-vf",
+                              "format=gray,crop=2:2:179:519", "-f", "rawvideo", "-"], capture_output=True).stdout
+        return raw[0]
+
+    assert pixel(0.5) > 200 and pixel(1.5) < 120 and pixel(2.5) > 200  # blurred only from 1 s to 2 s

@@ -26,6 +26,7 @@ let ctx = null;
 // New subtitles: { cues: [{ id, start, end, text }], burn: on/off, size: text height as a fraction of the picture }.
 S.subs = null;
 S.selCue = null;
+S.selBlur = null; // the selected part of the 🌫 Blur track
 const SUB_DEFAULTS = { burn: true, size: 0.034 };
 
 // ---------- small helpers ----------
@@ -169,6 +170,8 @@ function applyPayload(p) {
     setBanner('');
   }
   S.dur = computeDur();
+  if (v && v.has_video !== false) ensureBlur();
+  if (S.selBlur && !blurById(S.selBlur)) { S.selBlur = null; S.editSubs = false; }
   render();
   renderInspector();
   S.stretched = {};
@@ -306,6 +309,13 @@ function render() {
       '" title="Turn the new subtitles off / on (preview and export)">M</button><button data-act="cue-add" title="Add a subtitle at the playhead (N)">+</button>' +
       '<button data-act="subs-panel" title="Subtitle settings">⚙ ' + cues.length + '</button></div></div>' +
       '<div class="vxe-lane" data-lane="subs" style="width:' + W + 'px">' + subGuides + cues.map(cueHtml).join('') + '</div></div>';
+    const parts = blurParts();
+    html += '<div class="vxe-trackrow vxe-blurtrack"><div class="vxe-head"><div class="vxe-head-name">🌫 Blur</div>' +
+      '<div class="vxe-head-tools"><button data-act="blur-toggle" class="' + (blurOn() ? '' : 'vxe-on-m') +
+      '" title="Hide the original subtitles during the blurs / keep them all (preview and export)">M</button>' +
+      '<button data-act="blur-add" title="Add a blur at the playhead (double-click the track adds one there)">+</button>' +
+      '<span style="color:var(--vxe-dim);font-size:11px">' + parts.length + '</span></div></div>' +
+      '<div class="vxe-lane" data-lane="blur" style="width:' + W + 'px">' + parts.map(blurHtml).join('') + '</div></div>';
   }
   if (v) {
     const regs = regions().map((r) => '<div class="vxe-region' + (uncovered(r) ? ' vxe-uncovered' : '') + '" style="left:' +
@@ -431,6 +441,9 @@ function updateClipEl(key) {
 function renderSelection() {
   if (S.sel.size) { S.selCue = null; S.selSec = null; }
   if (S.selCue) S.selSec = null;
+  if (S.sel.size || S.selCue || S.selSec != null) S.selBlur = null;
+  if (!S.selBlur) S.editSubs = false;
+  content.querySelectorAll('[data-blur]').forEach((el) => el.classList.toggle('vxe-selected', el.dataset.blur === S.selBlur));
   content.querySelectorAll('[data-osec]').forEach((el) => el.classList.toggle('vxe-selected', +el.dataset.osec === S.selSec));
   content.querySelectorAll('[data-cue]').forEach((el) => el.classList.toggle('vxe-selected', el.dataset.cue === S.selCue));
   content.querySelectorAll('[data-clip]').forEach((el) => el.classList.toggle('vxe-selected', S.sel.has(el.dataset.clip)));
@@ -458,7 +471,8 @@ function setZoom(pps, anchorT, clientX) {
 }
 
 // ---------- edits, undo, save ----------
-const snapshot = () => JSON.stringify({ clips: S.clips, tracks: S.tracks, subs: S.subs, secs: S.mix.orig_sections || null });
+const snapshot = () => JSON.stringify({ clips: S.clips, tracks: S.tracks, subs: S.subs, secs: S.mix.orig_sections || null,
+  blur: S.mix.subs ? { mode: S.mix.subs.mode, box: S.mix.subs.box, parts: S.mix.subs.parts } : null });
 function pushUndo(before) {
   S.undo.push(before || snapshot());
   if (S.undo.length > 200) S.undo.shift();
@@ -468,6 +482,8 @@ function restore(snap) {
   const s = JSON.parse(snap);
   S.clips = s.clips; S.tracks = s.tracks; S.subs = s.subs;
   if (s.secs) S.mix.orig_sections = s.secs; else delete S.mix.orig_sections;
+  if (s.blur) { S.mix.subs = Object.assign(S.mix.subs || {}, s.blur); q('subs-mode').value = S.mix.subs.mode || 'off'; }
+  if (S.selBlur && !blurById(S.selBlur)) { S.selBlur = null; S.editSubs = false; }
   if (S.selSec != null && S.selSec >= sections().length) S.selSec = null;
   S.sel = new Set(selKeys());
   if (S.selCue && !cueById(S.selCue)) S.selCue = null;
@@ -783,12 +799,14 @@ content.addEventListener('pointerdown', (e) => {
   if (secEl) {
     // A part of the original sound: select it (it does not move: it has to stay in time with the picture).
     seek(timeAtClientX(e.clientX));
-    S.selSec = +secEl.dataset.osec; S.sel.clear(); S.selCue = null; S.panel = null;
+    S.selSec = +secEl.dataset.osec; S.sel.clear(); S.selCue = null; S.selBlur = null; S.panel = null;
     renderSelection();
     return;
   }
   const cueEl = e.target.closest('[data-cue]');
   if (cueEl) { startCueDrag(e, cueEl); return; }
+  const blurEl = e.target.closest('[data-blur]');
+  if (blurEl) { startBlurDrag(e, blurEl); return; }
   const el = e.target.closest('[data-clip]');
   if (el) {
     if (e.altKey && !el.classList.contains('vxe-missing') && !e.target.dataset.h) {
@@ -808,10 +826,11 @@ content.addEventListener('pointerdown', (e) => {
     const onUp = () => { lane.removeEventListener('pointermove', onMove); lane.removeEventListener('pointerup', onUp); };
     lane.addEventListener('pointermove', onMove);
     lane.addEventListener('pointerup', onUp);
-  } else if (!e.shiftKey && (S.sel.size || S.selCue || S.selSec != null)) {
+  } else if (!e.shiftKey && (S.sel.size || S.selCue || S.selSec != null || S.selBlur)) {
     S.sel.clear();
     S.selCue = null;
     S.selSec = null;
+    S.selBlur = null;
     renderSelection();
   }
 });
@@ -825,6 +844,9 @@ content.addEventListener('dblclick', (e) => {
   }
   const lane = e.target.closest('[data-lane="subs"]');
   if (lane) { addCue(timeAtClientX(e.clientX)); return; }
+  const blurEl = e.target.closest('[data-blur]');
+  if (blurEl) { seek(blurById(blurEl.dataset.blur).start); return; }
+  if (e.target.closest('[data-lane="blur"]')) { addBlur(timeAtClientX(e.clientX)); return; }
   const el = e.target.closest('[data-clip]');
   if (!el || e.altKey) return;
   seek(S.clips[el.dataset.clip].start);
@@ -848,6 +870,17 @@ content.addEventListener('click', (e) => {
     toggleSubs();
   } else if (b.dataset.act === 'cue-add') {
     addCue(now());
+  } else if (b.dataset.act === 'blur-add') {
+    addBlur(now());
+  } else if (b.dataset.act === 'blur-toggle') {
+    const subs = ensureBlur();
+    if (blurOn()) { pushUndo(); subs.mode = 'off'; q('subs-mode').value = 'off'; changed(); setStatus('🌫 Blur off — the original subtitles are kept (the blurs stay on the track).'); }
+    else if (!subs.parts.length) { q('subs-mode').value = 'blur'; q('subs-mode').dispatchEvent(new Event('change')); }
+    else {
+      // Back on: every blur keeps its own look (the toolbar's choice would give them all the same one).
+      pushUndo(); subs.mode = subs.parts[0].mode || 'blur'; q('subs-mode').value = subs.mode; changed();
+      setStatus('🌫 Blur on — the original subtitles are hidden during each blur on the track.');
+    }
   } else if (b.dataset.act === 'subs-panel') {
     S.panel = 'subs';
     renderInspector();
@@ -1158,6 +1191,7 @@ function renderInspector() {
   if (S.panel === 'levels') return renderLevelsPanel();
   if (S.selSec != null && sections()[S.selSec]) return renderSectionPanel(S.selSec);
   if (S.selCue && cueById(S.selCue)) return renderCuePanel(cueById(S.selCue));
+  if (S.selBlur && blurById(S.selBlur)) return renderBlurPanel(blurById(S.selBlur));
   const sel = selKeys();
   if (sel.length === 1) return renderClipPanel(sel[0]);
   if (sel.length > 1) {
@@ -1327,7 +1361,7 @@ function runAction(act) {
   }
   else if (act === 'speech-panel') { S.panel = 'speech'; renderInspector(); }
   else if (act === 'close-panel') { S.panel = null; renderInspector(); }
-  else if (act === 'levels-panel') { S.panel = 'levels'; S.sel.clear(); S.selCue = null; S.selSec = null; render(); renderInspector(); }
+  else if (act === 'levels-panel') { S.panel = 'levels'; S.sel.clear(); S.selCue = null; S.selSec = null; S.selBlur = null; render(); renderInspector(); }
   else if (act === 'lv-reset') resetClipVolumes();
   else if (act === 'detect') detectAgain();
   else return false;
@@ -1425,7 +1459,7 @@ async function doExport() {
   if (!S.data || !S.data.video) { showError('Add a video first.'); return; }
   pause();
   try {
-    const cleaning = ((S.mix.subs && S.mix.subs.mode !== 'off') || (subsOn() && S.subs.cues.length)) && S.data.video.has_video !== false;
+    const cleaning = ((blurOn() && blurParts().length) || (subsOn() && S.subs.cues.length)) && S.data.video.has_video !== false;
     busy('Exporting: mixing the new voices onto the video…' + (S.mix.original === 'music' && !S.data.video.isolated ? ' Separating the music first can take a few minutes.' : '') +
       (cleaning ? ' Removing the subtitles from the picture re-encodes it at its original size (about half the video\'s length).' : ''));
     clearTimeout(S.saveTimer);
@@ -1447,28 +1481,212 @@ function videoRect() {
   const w = vw * scale, h = vh * scale;
   return { x: el.left - host.left + (el.width - w) / 2, y: el.top - host.top + (el.height - h) / 2, w, h };
 }
+// The 🌫 Blur track: S.mix.subs = { mode, box, parts: [{ id, start, end, box, mode }] } — each part hides its own box
+// ('blur' or 'fill') from start to end; mode 'off' keeps every subtitle (the parts stay on the track). mode and box are
+// what a new part starts with.
+const BLUR_LABELS = { blur: '🌫 Blurred', fill: '🩹 Removed' };
+const blurParts = () => (S.mix.subs && S.mix.subs.parts) || [];
+const blurById = (id) => blurParts().find((p) => p.id === id) || null;
+const blurOn = () => !!(S.mix.subs && S.mix.subs.mode !== 'off');
+function ensureBlur() {
+  S.mix.subs = Object.assign({ mode: 'off', box: [0.1, 0.75, 0.8, 0.07] }, S.mix.subs || {});
+  if (!Array.isArray(S.mix.subs.parts)) {
+    // A project from before the track: its area was hidden all the time — one part over the whole video.
+    const s = S.mix.subs, len = videoLength() || S.dur;
+    s.parts = s.mode !== 'off' && len > 0 ? [{ id: 'b1', start: 0, end: r3(len), box: s.box.slice(), mode: s.mode }] : [];
+  }
+  return S.mix.subs;
+}
+function newBlurId() {
+  let n = blurParts().length + 1;
+  while (blurById('b' + n)) n++;
+  return 'b' + n;
+}
+function blurAt(t) { return blurParts().filter((p) => p.start <= t && t < p.end); }
+function shownBlur(t) {
+  // The part drawn on the video: the selected one while its area is edited, else the one playing (the selected first).
+  const sel = blurById(S.selBlur);
+  if (S.editSubs && sel) return sel;
+  if (!blurOn()) return null;
+  const on = blurAt(t);
+  return on.find((p) => p.id === S.selBlur) || on[0] || null;
+}
+function blurHtml(p) {
+  const mode = p.mode || S.mix.subs.mode;
+  return '<div class="vxe-blurpart vxe-' + (mode === 'fill' ? 'fill' : 'blur') + (p.id === S.selBlur ? ' vxe-selected' : '') +
+    (blurOn() ? '' : ' vxe-off') + '" data-blur="' + esc(p.id) + '" title="' + esc((BLUR_LABELS[mode] || '') + ' ' + fmt(p.start) + ' → ' + fmt(p.end)) +
+    '" style="left:' + tToX(p.start) + 'px;width:' + Math.max(tToX(p.end - p.start), 4) + 'px">' +
+    '<div class="vxe-handle vxe-l" data-h="l"></div><div class="vxe-handle vxe-r" data-h="r"></div>' +
+    '<div class="vxe-clip-label">' + (BLUR_LABELS[mode] || '') + '</div></div>';
+}
+function selectBlur(id) {
+  S.selBlur = id; S.sel.clear(); S.selCue = null; S.selSec = null; S.panel = null;
+  renderSelection();
+}
+function addBlur(t, quiet) {
+  const subs = ensureBlur();
+  pushUndo();
+  // Up to 3 s, stopping before the next part; the area and look of the selected part (or the last one used).
+  const len = videoLength() || S.dur;
+  const next = subs.parts.filter((p) => p.start > t + 0.05).map((p) => p.start);
+  const end = Math.min(t + 3, len || t + 3, next.length ? Math.min(...next) : Infinity);
+  const like = blurById(S.selBlur);
+  const part = { id: newBlurId(), start: r3(t), end: r3(Math.max(end, t + 0.5)), box: (like ? like.box : subs.box).slice(),
+    mode: like ? like.mode : subs.mode !== 'off' ? subs.mode : 'blur' };
+  subs.parts.push(part);
+  subs.parts.sort((a, b) => a.start - b.start);
+  if (subs.mode === 'off') { subs.mode = part.mode; q('subs-mode').value = subs.mode; }
+  S.selBlur = part.id; S.sel.clear(); S.selCue = null; S.selSec = null; S.panel = null;
+  changed();
+  if (!quiet) setStatus('🌫 Blur added at ' + fmt(t) + ' — drag it or its edges on the 🌫 Blur track to change when it hides the subtitles; <b>✏️ Edit area</b> moves it on the picture.');
+  return part;
+}
+function deleteBlur(id) {
+  if (!blurById(id)) return;
+  pushUndo();
+  S.mix.subs.parts = blurParts().filter((p) => p.id !== id);
+  S.selBlur = null; S.editSubs = false;
+  changed();
+}
+function splitBlurAt(id, t) {
+  const p = blurById(id);
+  if (!p || t <= p.start + 0.1 || t >= p.end - 0.1) { setStatus('✂ Put the playhead inside the blur (not at its very edge) to split it there.'); return; }
+  pushUndo();
+  const second = Object.assign({}, p, { id: newBlurId(), start: r3(t), box: p.box.slice() });
+  p.end = r3(t);
+  S.mix.subs.parts.push(second);
+  S.mix.subs.parts.sort((a, b) => a.start - b.start);
+  S.selBlur = second.id;
+  changed();
+}
+function editBlurArea() {
+  // ✏️ Area: edit the selected part's box — or the one at the playhead, or a new one there.
+  ensureBlur();
+  if (S.editSubs) { S.editSubs = false; setStatus(''); renderInspector(); return; }
+  if (!blurById(S.selBlur)) {
+    const at = blurAt(now())[0];
+    if (at) selectBlur(at.id); else addBlur(now(), true);
+  }
+  S.editSubs = true;
+  if (now() < blurById(S.selBlur).start || now() >= blurById(S.selBlur).end) seek(blurById(S.selBlur).start);
+  renderInspector();
+  setStatus('✏️ Drag the yellow box over the subtitles in the video; drag a corner to resize. Click ✏️ Area again when done.');
+}
+function startBlurDrag(e, el) {
+  const id = el.dataset.blur, p = blurById(id), handle = e.target.dataset.h;
+  if (S.selBlur !== id) selectBlur(id);
+  const before = snapshot(), p0 = Object.assign({}, p), x0 = e.clientX;
+  let moved = false;
+  el.setPointerCapture(e.pointerId);
+  const snaps = [now(), 0];
+  if (videoLength()) snaps.push(videoLength());
+  keys().forEach((k) => { if (audible(k)) snaps.push(S.clips[k].start, clipEnd(k)); });
+  (S.subs ? S.subs.cues : []).forEach((c) => snaps.push(c.start, c.end));
+  blurParts().forEach((o) => { if (o.id !== id) snaps.push(o.start, o.end); });
+  const snapTo = (t) => {
+    let best = t, dist = 8 / S.pps;
+    snaps.forEach((s) => { if (Math.abs(s - t) < dist) { dist = Math.abs(s - t); best = s; } });
+    return best;
+  };
+  const onMove = (ev) => {
+    if (!moved && Math.abs(ev.clientX - x0) < 3) return;
+    moved = true;
+    const dt = (ev.clientX - x0) / S.pps, snapOn = q('snap').checked && !ev.altKey;
+    const len = p0.end - p0.start;
+    if (!handle) {
+      let start = Math.max(0, p0.start + dt);
+      if (snapOn) { const s1 = snapTo(start), s2 = snapTo(start + len) - len; start = Math.abs(s1 - start) <= Math.abs(s2 - start) ? s1 : s2; }
+      p.start = r3(Math.max(0, start)); p.end = r3(p.start + len);
+    } else if (handle === 'l') {
+      let start = p0.start + dt;
+      if (snapOn) start = snapTo(start);
+      p.start = r3(clamp(start, 0, p.end - 0.1));
+    } else {
+      let end = p0.end + dt;
+      if (snapOn) end = snapTo(end);
+      p.end = r3(Math.max(end, p.start + 0.1));
+    }
+    el.style.left = tToX(p.start) + 'px';
+    el.style.width = Math.max(tToX(p.end - p.start), 4) + 'px';
+    q('time').textContent = fmt(handle === 'r' ? p.end : p.start);
+  };
+  const onUp = () => {
+    el.removeEventListener('pointermove', onMove);
+    el.removeEventListener('pointerup', onUp);
+    el.removeEventListener('pointercancel', onUp);
+    if (!moved) return;
+    pushUndo(before);
+    S.mix.subs.parts.sort((a, b) => a.start - b.start);
+    changed();
+  };
+  el.addEventListener('pointermove', onMove);
+  el.addEventListener('pointerup', onUp);
+  el.addEventListener('pointercancel', onUp);
+}
+function renderBlurPanel(p) {
+  const mode = p.mode || S.mix.subs.mode;
+  insp.innerHTML = '<h3>🌫 Blur</h3>' +
+    field('Starts at', '<input type="number" step="0.01" min="0" data-bf="start" value="' + p.start.toFixed(2) + '"> s') +
+    field('Ends at', '<input type="number" step="0.01" min="0" data-bf="end" value="' + p.end.toFixed(2) + '"> s · ' + (p.end - p.start).toFixed(2) + ' s long') +
+    field('Hide by', '<select data-bf="mode"><option value="blur"' + (mode === 'blur' ? ' selected' : '') + '>Blurring it</option>' +
+      '<option value="fill"' + (mode === 'fill' ? ' selected' : '') + '>Removing it (filled in)</option></select>') +
+    '<div class="vxe-actions"><button class="vxe-btn' + (S.editSubs ? ' vxe-primary' : '') + '" data-act="blur-area">✏️ ' + (S.editSubs ? 'Done editing the area' : 'Edit area on the video') + '</button>' +
+    '<button class="vxe-btn" data-act="blur-play">▶ Play</button>' +
+    '<button class="vxe-btn" data-act="blur-split" title="Split it in two at the playhead (C)">✂ Split at playhead</button>' +
+    '<button class="vxe-btn" data-act="blur-whole" title="From the start to the end of the video">↔ Whole video</button>' +
+    '<button class="vxe-btn" data-act="blur-add-here">+ New blur at playhead</button>' +
+    '<button class="vxe-btn" data-act="blur-del" title="Delete (Delete)">🗑 Delete</button></div>' +
+    '<div class="vxe-muted-note">Drag it on the 🌫 Blur track to move it, its edges to change when it starts or ends. Each blur has its own area: ' +
+    'select it and use ✏️ to move or resize it on the video.' + (blurOn() ? '' : ' <b>Original subtitles are set to Kept</b> — no blur is applied until you choose Blurred or Removed in the toolbar.') + '</div>';
+}
+insp.addEventListener('change', (e) => {
+  const bf = e.target.dataset.bf, p = blurById(S.selBlur);
+  if (!bf || !p) return;
+  pushUndo();
+  if (bf === 'start') p.start = r3(clamp(+e.target.value || 0, 0, p.end - 0.1));
+  if (bf === 'end') p.end = r3(Math.max(+e.target.value || 0, p.start + 0.1));
+  if (bf === 'mode') { p.mode = e.target.value; S.mix.subs.mode = blurOn() ? S.mix.subs.mode : p.mode; q('subs-mode').value = S.mix.subs.mode; }
+  S.mix.subs.parts.sort((a, b) => a.start - b.start);
+  changed();
+});
+insp.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-act]');
+  if (!b || !b.dataset.act.startsWith('blur-')) return;
+  const act = b.dataset.act, p = blurById(S.selBlur);
+  if (act === 'blur-add-here') addBlur(now());
+  else if (!p) return;
+  else if (act === 'blur-area') editBlurArea();
+  else if (act === 'blur-play') { seek(p.start); play(); }
+  else if (act === 'blur-split') splitBlurAt(p.id, now());
+  else if (act === 'blur-whole') { pushUndo(); p.start = 0; p.end = r3(videoLength() || S.dur); changed(); }
+  else if (act === 'blur-del') deleteBlur(p.id);
+});
+
 function placeSubBox() {
-  const box = q('subbox'), subs = S.mix.subs || {};
+  const box = q('subbox');
   const v = S.data && S.data.video;
   const r = v && v.has_video !== false && hasVideo() ? videoRect() : null;
-  const on = !!(r && subs.box && (subs.mode !== 'off' || S.editSubs));
+  const part = r ? shownBlur(now()) : null;
+  const on = !!(part && part.box);
   box.classList.toggle('vxe-on', on);
   box.classList.toggle('vxe-edit', on && !!S.editSubs);
   if (!on) return;
-  const [x, y, w, h] = subs.box;
+  const [x, y, w, h] = part.box;
   box.style.left = (r.x + x * r.w) + 'px'; box.style.top = (r.y + y * r.h) + 'px';
   box.style.width = (w * r.w) + 'px'; box.style.height = (h * r.h) + 'px';
   // Kept: only the outline while editing; filled in / blurred: the preview blurs it (the export fills it in).
-  const blur = subs.mode === 'off' ? '0px' : subs.mode === 'blur' ? '9px' : '14px';
+  const mode = blurOn() ? part.mode || S.mix.subs.mode : 'off';
+  const blur = mode === 'off' ? '0px' : mode === 'blur' ? '9px' : '14px';
   box.style.backdropFilter = box.style.webkitBackdropFilter = 'blur(' + blur + ')';
 }
 q('subbox').addEventListener('pointerdown', (e) => {
   if (!S.editSubs) return;
   e.preventDefault(); e.stopPropagation();
-  const r = videoRect(), subs = S.mix.subs;
-  if (!r || !subs || !subs.box) return;
+  const r = videoRect(), part = shownBlur(now());
+  if (!r || !part || !part.box) return;
   const corner = e.target.dataset.corner;
-  const [x0, y0, w0, h0] = subs.box, px = e.clientX, py = e.clientY;
+  const [x0, y0, w0, h0] = part.box, px = e.clientX, py = e.clientY;
+  const before = snapshot();
   const el = q('subbox');
   el.setPointerCapture(e.pointerId);
   const move = (ev) => {
@@ -1482,27 +1700,47 @@ q('subbox').addEventListener('pointerdown', (e) => {
       if (corner.includes('s')) h = Math.max(h0 + dy, 0.01);
     }
     w = Math.min(w, 1); h = Math.min(h, 1);
-    subs.box = [clamp(x, 0, 1 - w), clamp(y, 0, 1 - h), w, h].map((v) => Math.round(v * 10000) / 10000);
+    part.box = [clamp(x, 0, 1 - w), clamp(y, 0, 1 - h), w, h].map((v) => Math.round(v * 10000) / 10000);
+    S.mix.subs.box = part.box.slice(); // a new blur starts with the area used last
     placeSubBox();
   };
-  const up = () => { el.removeEventListener('pointermove', move); el.removeEventListener('pointerup', up); changed(true); };
+  const up = () => {
+    el.removeEventListener('pointermove', move); el.removeEventListener('pointerup', up);
+    pushUndo(before);
+    changed(true);
+  };
   el.addEventListener('pointermove', move);
   el.addEventListener('pointerup', up);
 });
 q('subs-mode').addEventListener('change', (e) => {
-  S.mix.subs = Object.assign({ box: [0.1, 0.75, 0.8, 0.07] }, S.mix.subs || {}, { mode: e.target.value });
+  const subs = ensureBlur(), mode = e.target.value;
+  pushUndo();
+  subs.mode = mode;
+  if (mode !== 'off') {
+    // Every blur on the track takes this look (each can be changed on its own when selected); none yet: the whole video.
+    subs.parts.forEach((p) => { p.mode = mode; });
+    if (!subs.parts.length) subs.parts.push({ id: newBlurId(), start: 0, end: r3(videoLength() || S.dur), box: subs.box.slice(), mode });
+  }
   changed(true);
-  setStatus(e.target.value === 'off' ? 'The subtitles in the picture are kept.' :
-    'The subtitles in the picture are ' + (e.target.value === 'fill' ? 'removed (filled in from around them)' : 'blurred') +
-    ' in the export — the video is re-encoded at its original size (about half its length to export). ' +
-    'The preview shows the area blurred; <b>✏️ Area</b> moves it.');
+  setStatus(mode === 'off' ? 'The subtitles in the picture are kept (the blurs stay on the 🌫 Blur track, switched off).' :
+    'The subtitles in the picture are ' + (mode === 'fill' ? 'removed (filled in from around them)' : 'blurred') +
+    ' during each blur on the 🌫 Blur track — drag them to change when; select one and use ✏️ to move its area. ' +
+    'The export re-encodes the video at its original size (about half its length to export).');
 });
 async function findSubtitles() {
   try {
     busy('Looking for subtitles in the picture…');
     const r = await call('editor_find_subtitles');
     applyPayload(r);
-    S.editSubs = true;
+    if (r.found) {
+      // The found area goes to the selected blur, or to every blur (none yet: one over the whole video).
+      const subs = ensureBlur(), sel = blurById(S.selBlur);
+      (sel ? [sel] : subs.parts).forEach((p) => { p.box = subs.box.slice(); });
+      if (!subs.parts.length && subs.mode !== 'off') subs.parts.push({ id: newBlurId(), start: 0, end: r3(videoLength() || S.dur), box: subs.box.slice(), mode: subs.mode });
+      if (!blurById(S.selBlur) && subs.parts.length) S.selBlur = subs.parts[0].id;
+      changed();
+    }
+    S.editSubs = !!blurById(S.selBlur);
     setStatus(r.found ? '🔍 Found the subtitles — the area is shown on the video; drag it or its corners to adjust, then ✏️ Area to finish.'
       : '🔍 No subtitles found in the picture. If there are some, use ✏️ Area and drag the box over them.');
   } catch (e) { showError(e); } finally { busy(''); }
@@ -2073,12 +2311,7 @@ root.querySelector('.vxe-toolbar').addEventListener('click', (e) => {
   else if (act === 'change-video') q('file').click();
   else if (act === 'reload') reload();
   else if (act === 'fullscreen') toggleFullscreen();
-  else if (act === 'subs-area') {
-    S.editSubs = !S.editSubs;
-    if (S.editSubs && (!S.mix.subs || S.mix.subs.mode === 'off')) setStatus('The subtitles are kept — choose <b>Removed</b> or <b>Blurred</b> to hide this area.');
-    else if (S.editSubs) setStatus('✏️ Drag the yellow box over the subtitles in the video; drag a corner to resize. Click ✏️ Area again when done.');
-    else setStatus('');
-  }
+  else if (act === 'subs-area') editBlurArea();
   else if (act === 'subs-find') findSubtitles();
   else if (act === 'orig-toggle') toggleOriginal();
   else if (act === 'captions') toggleSubs();
@@ -2134,12 +2367,14 @@ document.addEventListener('keydown', (e) => {
   else if (key === 'ArrowUp') stepClip(-1);
   else if (key === 'ArrowDown') stepClip(1);
   else if ((key === 'c' || key === 'b') && S.selSec != null) cutSection(now());
+  else if ((key === 'c' || key === 'b') && S.selBlur) splitBlurAt(S.selBlur, now());
   else if (key === 'c' || key === 'b') cutAt(now(), sel.length ? sel : null);
   else if (key === 'j' && S.selSec != null) joinSection(S.selSec);
   else if (key === 'j') joinPieces(selKeys());
   else if ((key === 'm' || key === 'Delete' || key === 'Backspace') && S.selSec != null) muteSection(S.selSec);
   else if ((key === '[' || key === ']') && sel.length) stepSpeed(sel, key === '[' ? -0.05 : 0.05);
   else if ((key === 'Delete' || key === 'Backspace') && S.selCue) deleteCue(S.selCue);
+  else if ((key === 'Delete' || key === 'Backspace') && S.selBlur) deleteBlur(S.selBlur);
   else if ((key === 'Delete' || key === 'Backspace') && sel.length) deletePieces(sel);
   else if (key === 'n' && S.data && S.data.video) addCue(now());
   else if (key === 'm' && sel.length) toggleMute(sel);
@@ -2150,7 +2385,7 @@ document.addEventListener('keydown', (e) => {
   else if (key === 'Escape' && root.classList.contains('vxe-max')) toggleFullscreen();
   else if (key === 'Home') seek(0);
   else if (key === 'End') seek(S.dur);
-  else if (key === 'Escape') { S.sel.clear(); S.selCue = null; S.selSec = null; renderSelection(); }
+  else if (key === 'Escape') { S.sel.clear(); S.selCue = null; S.selSec = null; S.selBlur = null; renderSelection(); }
   else handled = false;
   if (handled) e.preventDefault();
 });

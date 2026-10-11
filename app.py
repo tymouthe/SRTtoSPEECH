@@ -1231,7 +1231,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
             script_voice.make_voice_template(
                 voicer, v["name"], v["gender"], v["age"], v["description"], seed=1000 + 97 * i,
                 options=dubbing.DubOptions(**_TEMPLATE_OPTIONS), starter=True,
-                candidates=6 if v["age"] == "kid" else 1, gender_refs=refs, embed=embed,
+                candidates=6, gender_refs=refs, embed=embed,  # the clearest of 6 versions
             )
             made.append(v["name"])
         return _library_view() + (f"✨ Made {len(made)} voice(s): {', '.join(made)}. Listen to them above and give them to your speakers.",)
@@ -1249,7 +1249,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
         refs, embed = _gender_judge() if gender in ("male", "female") else ({}, None)
         script_voice.make_voice_template(voicer, str(name).strip(), gender, age, str(description or "").strip(), seed=seed,
                                          options=dubbing.DubOptions(**_TEMPLATE_OPTIONS),
-                                         candidates=4 if embed else 1, gender_refs=refs, embed=embed)
+                                         candidates=4, gender_refs=refs, embed=embed)  # the clearest of 4 versions
         return _library_view() + (f"🎨 Made the voice **{name}**.",)
 
     def _keep_speaker_voice(workdir, speaker, name, speaker_rows):
@@ -1267,7 +1267,8 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
     def _upload_voice(clip, name, gender, age):
         if not clip:
             raise gr.Error("Upload a clip first (5–15 s of one person speaking clearly).")
-        script_voice.save_voice_template(str(name or "").strip() or Path(clip).stem, clip, gender, age, "Uploaded clip")
+        script_voice.save_voice_template(str(name or "").strip() or Path(clip).stem, clip, gender, age,
+                                         script_voice.UPLOADED_DESCRIPTION)
         return _library_view() + (f"⬆️ Saved the clip as the template **{str(name or '').strip() or Path(clip).stem}**.",)
 
     def _delete_voice(name):
@@ -1497,7 +1498,8 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
         video_editor.ensure_subtitle_box(state["video"])
         box = state["video"].get("subtitle_box")
         if box:
-            state["mix"]["subs"] = {"mode": (state["mix"].get("subs") or {}).get("mode", "fill"), "box": box}
+            old = state["mix"].get("subs") or {}  # its parts on the 🌫 Blur track are kept (the editor moves them there)
+            state["mix"]["subs"] = dict(old, mode=old.get("mode", "fill"), box=box)
         video_editor.save_state(workdir, state)
         return _payload(workdir) | {"found": bool(box)}
 
