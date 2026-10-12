@@ -109,12 +109,16 @@ function showError(e) {
 
 // ---------- loading the project ----------
 function computeDur() {
-  let d = 5;
-  if (S.data && S.data.video) d = Math.max(d, S.data.video.duration || 0);
+  // The timeline ends where the video ends (it can't be scrolled past it) — or where the last clip, subtitle or blur
+  // ends if one goes past it. Without a video: the last line or clip, and a little room after it.
+  let d = (S.data && S.data.video && S.data.video.duration) || 0;
   if (video.duration && isFinite(video.duration)) d = Math.max(d, video.duration);
-  S.lines.forEach((l) => { d = Math.max(d, l.end); });
+  const media = d > 0;
+  if (!media) { d = 5; S.lines.forEach((l) => { d = Math.max(d, l.end); }); }
   keys().forEach((k) => { d = Math.max(d, clipEnd(k)); });
-  return d + 2;
+  (S.subs ? S.subs.cues : []).forEach((c) => { d = Math.max(d, c.end); });
+  blurParts().forEach((p) => { d = Math.max(d, p.end); });
+  return media ? d : d + 2;
 }
 
 function applyPayload(p) {
@@ -292,7 +296,7 @@ function clipHtml(key, bad) {
 }
 
 function render() {
-  const W = Math.ceil(tToX(S.dur)) + 40;
+  const W = Math.ceil(tToX(S.dur));
   content.style.width = (HEAD + W) + 'px';
   const bad = overlaps();
   let html = '<div class="vxe-trackrow vxe-ruler"><div class="vxe-head">' + esc(S.data ? S.data.project : '') +
@@ -314,6 +318,7 @@ function render() {
       '<div class="vxe-head-tools"><button data-act="blur-toggle" class="' + (blurOn() ? '' : 'vxe-on-m') +
       '" title="Hide the original subtitles during the blurs / keep them all (preview and export)">M</button>' +
       '<button data-act="blur-add" title="Add a blur at the playhead (double-click the track adds one there)">+</button>' +
+      '<button data-act="blur-match" title="Place the blurs over the subtitles again: one per subtitle (replaces the ones on the track)">💬</button>' +
       '<span style="color:var(--vxe-dim);font-size:11px">' + parts.length + '</span></div></div>' +
       '<div class="vxe-lane" data-lane="blur" style="width:' + W + 'px">' + parts.map(blurHtml).join('') + '</div></div>';
   }
@@ -365,7 +370,9 @@ function renderVisible() {
   // Ruler ticks and the video waveform are drawn only for the part of the timeline in view.
   const lane = content.querySelector('[data-lane="ruler"]');
   if (!lane) return;
-  const x0 = Math.max(scroll.scrollLeft - 200, 0), x1 = scroll.scrollLeft + scroll.clientWidth + 200;
+  // Never past the end of the timeline: anything drawn there would let it scroll on past the end of the video.
+  const end = Math.ceil(tToX(S.dur));
+  const x0 = Math.max(scroll.scrollLeft - 200, 0), x1 = Math.min(scroll.scrollLeft + scroll.clientWidth + 200, end);
   const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200];
   const step = steps.find((s) => s * S.pps >= 70) || 1200;
   const minor = step / 5;
@@ -373,7 +380,7 @@ function renderVisible() {
   for (let t = Math.floor(x0 / S.pps / step) * step; t * S.pps <= x1 && t <= S.dur; t += step) {
     html += '<div class="vxe-tick" style="left:' + tToX(t) + 'px">' + fmt(t, step >= 1) + '</div>';
     if (minor * S.pps >= 10) {
-      for (let k = 1; k < 5; k++) html += '<div class="vxe-tick vxe-minor" style="left:' + tToX(t + k * minor) + 'px"></div>';
+      for (let k = 1; k < 5 && t + k * minor <= S.dur; k++) html += '<div class="vxe-tick vxe-minor" style="left:' + tToX(t + k * minor) + 'px"></div>';
     }
   }
   lane.innerHTML = html;
@@ -872,6 +879,8 @@ content.addEventListener('click', (e) => {
     addCue(now());
   } else if (b.dataset.act === 'blur-add') {
     addBlur(now());
+  } else if (b.dataset.act === 'blur-match') {
+    matchBlursToSubtitles();
   } else if (b.dataset.act === 'blur-toggle') {
     const subs = ensureBlur();
     if (blurOn()) { pushUndo(); subs.mode = 'off'; q('subs-mode').value = 'off'; changed(); setStatus('🌫 Blur off — the original subtitles are kept (the blurs stay on the track).'); }
@@ -1489,13 +1498,56 @@ const blurParts = () => (S.mix.subs && S.mix.subs.parts) || [];
 const blurById = (id) => blurParts().find((p) => p.id === id) || null;
 const blurOn = () => !!(S.mix.subs && S.mix.subs.mode !== 'off');
 function ensureBlur() {
-  S.mix.subs = Object.assign({ mode: 'off', box: [0.1, 0.75, 0.8, 0.07] }, S.mix.subs || {});
+  S.mix.subs = Object.assign({ mode: 'off', box: wideBox([0, 0.75, 1, 0.07]) }, S.mix.subs || {});
   if (!Array.isArray(S.mix.subs.parts)) {
-    // A project from before the track: its area was hidden all the time — one part over the whole video.
-    const s = S.mix.subs, len = videoLength() || S.dur;
-    s.parts = s.mode !== 'off' && len > 0 ? [{ id: 'b1', start: 0, end: r3(len), box: s.box.slice(), mode: s.mode }] : [];
+    // A project from before the track: its area was hidden all the time — now one blur over each subtitle.
+    const s = S.mix.subs;
+    s.parts = s.mode !== 'off' ? blursFromSubtitles(s.box, s.mode) : [];
   }
   return S.mix.subs;
+}
+const BLUR_EDGE = 0.02; // a placed blur reaches this close to the left and right edges of the picture
+function wideBox(box) {
+  // The same height, nearly the full width: subtitles of any length (and the new ones drawn there) stay covered.
+  return [BLUR_EDGE, box[1], r3(1 - 2 * BLUR_EDGE), box[3]];
+}
+function subtitleSpans() {
+  // When the subtitles are on screen: the new (Khmer) subtitles, else the lines' SRT times — a little wider than each
+  // one, and ones close together joined, so the original subtitle never peeks out between two of them.
+  const PAD = 0.1, JOIN = 0.2, len = videoLength() || S.dur;
+  const src = S.subs && S.subs.cues.length ? S.subs.cues : S.lines;
+  const spans = [];
+  src.map((c) => [Math.max(c.start - PAD, 0), len > 0 ? Math.min(c.end + PAD, len) : c.end + PAD])
+    .filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0])
+    .forEach(([a, b]) => {
+      const last = spans[spans.length - 1];
+      if (last && a - last[1] < JOIN) last[1] = Math.max(last[1], b); else spans.push([a, b]);
+    });
+  return spans;
+}
+function blursFromSubtitles(box, mode, spans) {
+  // One blur over each subtitle — or each of these spans — (the whole video when there are none), all with this area
+  // and look.
+  const len = videoLength() || S.dur;
+  spans = spans && spans.length ? spans.map((s) => s.slice()) : subtitleSpans();
+  if (!spans.length && len > 0) spans.push([0, len]);
+  // A span found in the picture also says how wide its line is ([start, end, x, w]): the blur fits that line.
+  return spans.map(([a, b, x, w], n) => ({ id: 'b' + (n + 1), start: r3(a), end: r3(b),
+    box: w > 0 ? [r3(x), box[1], r3(w), box[3]] : wideBox(box), mode }));
+}
+function matchBlursToSubtitles() {
+  const subs = ensureBlur();
+  if (!subtitleSpans().length) { setStatus('💬 There are no subtitles to place the blurs on yet.'); return; }
+  pushUndo();
+  // The area and look of the selected blur (or the first one) for all of them.
+  const like = blurById(S.selBlur) || subs.parts[0];
+  const mode = like ? like.mode || subs.mode : subs.mode !== 'off' ? subs.mode : 'blur';
+  subs.parts = blursFromSubtitles(like ? like.box : subs.box, mode === 'off' ? 'blur' : mode);
+  if (subs.mode === 'off') { subs.mode = subs.parts[0].mode; q('subs-mode').value = subs.mode; }
+  S.selBlur = null; S.editSubs = false;
+  changed();
+  setStatus('💬 ' + subs.parts.length + ' blur(s) placed over the subtitles — the original subtitles are hidden while each new one is shown. ' +
+    'Drag a blur or its edges to adjust it; select one and use ✏️ to move its area.');
 }
 function newBlurId() {
   let n = blurParts().length + 1;
@@ -1635,6 +1687,7 @@ function renderBlurPanel(p) {
     '<button class="vxe-btn" data-act="blur-split" title="Split it in two at the playhead (C)">✂ Split at playhead</button>' +
     '<button class="vxe-btn" data-act="blur-whole" title="From the start to the end of the video">↔ Whole video</button>' +
     '<button class="vxe-btn" data-act="blur-add-here">+ New blur at playhead</button>' +
+    '<button class="vxe-btn" data-act="blur-match-all" title="Replace every blur with one over each subtitle, with this area and look">💬 Match all to subtitles</button>' +
     '<button class="vxe-btn" data-act="blur-del" title="Delete (Delete)">🗑 Delete</button></div>' +
     '<div class="vxe-muted-note">Drag it on the 🌫 Blur track to move it, its edges to change when it starts or ends. Each blur has its own area: ' +
     'select it and use ✏️ to move or resize it on the video.' + (blurOn() ? '' : ' <b>Original subtitles are set to Kept</b> — no blur is applied until you choose Blurred or Removed in the toolbar.') + '</div>';
@@ -1654,6 +1707,7 @@ insp.addEventListener('click', (e) => {
   if (!b || !b.dataset.act.startsWith('blur-')) return;
   const act = b.dataset.act, p = blurById(S.selBlur);
   if (act === 'blur-add-here') addBlur(now());
+  else if (act === 'blur-match-all') matchBlursToSubtitles();
   else if (!p) return;
   else if (act === 'blur-area') editBlurArea();
   else if (act === 'blur-play') { seek(p.start); play(); }
@@ -1712,19 +1766,42 @@ q('subbox').addEventListener('pointerdown', (e) => {
   el.addEventListener('pointermove', move);
   el.addEventListener('pointerup', up);
 });
-q('subs-mode').addEventListener('change', (e) => {
-  const subs = ensureBlur(), mode = e.target.value;
+async function originalSubtitleSpans(box) {
+  // When the subtitles burned into the video are on screen inside this area (the server looks once per area).
+  if (!S.data || !S.data.video || S.data.video.has_video === false) return [];
+  busy('Finding when the original subtitles are on screen…');
+  try { return (await call('editor_subtitle_times', { box: box })).spans || []; }
+  catch (e) { console.warn(e); return []; }
+  finally { busy(''); }
+}
+q('subs-mode').addEventListener('change', async (e) => {
+  const subs = ensureBlur(), mode = e.target.value, was = subs.mode;
+  // From Kept to Blurred / Removed: the blurs are placed again, nearly the full width, one over each original subtitle
+  // found in the picture (none found: over each new subtitle). Undo brings back the ones there were. Between Blurred
+  // and Removed: every blur takes the new look.
+  let found = [];
+  const place = mode !== 'off' && (was === 'off' || !subs.parts.length);
+  const box = wideBox(subs.parts.length ? subs.parts[0].box : subs.box);
+  if (place) {
+    found = await originalSubtitleSpans(box);
+    if (q('subs-mode').value !== mode) return; // changed again while it looked
+  }
+  const placed = place && (found.length > 0 || subtitleSpans().length > 0);
   pushUndo();
   subs.mode = mode;
-  if (mode !== 'off') {
-    // Every blur on the track takes this look (each can be changed on its own when selected); none yet: the whole video.
+  if (placed) {
+    subs.parts = blursFromSubtitles(box, mode, found);
+    S.selBlur = null; S.editSubs = false;
+  } else if (mode !== 'off') {
     subs.parts.forEach((p) => { p.mode = mode; });
-    if (!subs.parts.length) subs.parts.push({ id: newBlurId(), start: 0, end: r3(videoLength() || S.dur), box: subs.box.slice(), mode });
+    if (!subs.parts.length) subs.parts = blursFromSubtitles(subs.box, mode);
   }
   changed(true);
   setStatus(mode === 'off' ? 'The subtitles in the picture are kept (the blurs stay on the 🌫 Blur track, switched off).' :
     'The subtitles in the picture are ' + (mode === 'fill' ? 'removed (filled in from around them)' : 'blurred') +
-    ' during each blur on the 🌫 Blur track — drag them to change when; select one and use ✏️ to move its area. ' +
+    (placed ? ' — ' + subs.parts.length + ' blur(s) placed over ' + (found.length ? 'the original subtitles found in the picture, each as wide as its line' : 'the new subtitles (no original ones found in the blur area), nearly the full width') +
+      ' (Undo brings back the ones before). ' :
+      ' during each blur on the 🌫 Blur track — drag them to change when; select one and use ✏️ to move its area. ') +
     'The export re-encodes the video at its original size (about half its length to export).');
 });
 async function findSubtitles() {
@@ -1735,6 +1812,7 @@ async function findSubtitles() {
     if (r.found) {
       // The found area goes to the selected blur, or to every blur (none yet: one over the whole video).
       const subs = ensureBlur(), sel = blurById(S.selBlur);
+      subs.box = wideBox(subs.box);
       (sel ? [sel] : subs.parts).forEach((p) => { p.box = subs.box.slice(); });
       if (!subs.parts.length && subs.mode !== 'off') subs.parts.push({ id: newBlurId(), start: 0, end: r3(videoLength() || S.dur), box: subs.box.slice(), mode: subs.mode });
       if (!blurById(S.selBlur) && subs.parts.length) S.selBlur = subs.parts[0].id;

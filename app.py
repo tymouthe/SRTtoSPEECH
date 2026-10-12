@@ -1496,6 +1496,31 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
         return _payload(workdir) | {"found": bool(box)}
 
     @_safe
+    def editor_subtitle_times(arg):
+        # When and how wide the subtitles burned into the video are on screen inside the blur area (looked for once
+        # per area).
+        workdir = _project()
+        state = video_editor.load_state(workdir)
+        info = state.get("video") or {}
+        if not info.get("source") or not info.get("has_video", True):
+            return {"spans": []}
+        box = [round(float(v), 4) for v in (arg.get("box") or [])] or info.get("subtitle_box")
+        if not box or len(box) != 4:
+            if video_editor.ensure_subtitle_box(info):
+                video_editor.save_state(workdir, state)
+            box = info.get("subtitle_box")
+        if not box:
+            return {"spans": []}
+        cached = info.get("subtitle_spans") or {}
+        if cached.get("box") != box or cached.get("version") != video_editor.SUBTITLE_SPANS_VERSION:
+            cached = {"box": box, "spans": video_editor.detect_subtitle_spans(info["source"], box),
+                      "version": video_editor.SUBTITLE_SPANS_VERSION}
+            state = video_editor.load_state(workdir)  # saved by the editor while this ran: keep its changes
+            state["video"]["subtitle_spans"] = cached
+            video_editor.save_state(workdir, state)
+        return {"spans": cached["spans"]}
+
+    @_safe
     def editor_video(arg):
         workdir = _project()
         path = Path(str(arg.get("path") or "")).resolve()
@@ -1718,7 +1743,7 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
         elem_id="video-editor",
         server_functions=[
             editor_load, editor_video, editor_detect, editor_save, editor_edit_lines, editor_regenerate,
-            editor_status, editor_export, editor_speed, editor_find_subtitles,
+            editor_status, editor_export, editor_speed, editor_find_subtitles, editor_subtitle_times,
         ],
     )
 

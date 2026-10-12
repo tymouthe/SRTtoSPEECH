@@ -409,6 +409,103 @@ def detect_subtitle_box(video_path: str | Path, regions: list, samples: int = 30
     return find_subtitle_box(np.stack(frames)) if len(frames) >= 3 else None
 
 
+SUBTITLE_SCAN_FPS = 10  # pictures a second looked at to find when the burned-in subtitles are on screen
+
+
+def text_columns(frames: np.ndarray) -> np.ndarray:
+    """How much bright, sharp-edged text each column of each grey frame (``[n, height, width]``) shows:
+    ``[n, width - 1]`` (0: none)."""
+    gx = np.abs(np.diff(frames, axis=2))
+    bright = frames[:, :, 1:] > 200
+    return (gx * (bright | np.roll(bright, 1, axis=2))).mean(axis=1)
+
+
+def text_presence(frames: np.ndarray) -> np.ndarray:
+    """How much text each grey frame shows (0: none), see :func:`text_columns`."""
+    return text_columns(frames).mean(axis=1)
+
+
+def _text_threshold(score: np.ndarray) -> float:
+    return max(0.8, float(np.percentile(score, 95)) * 0.08)
+
+
+def find_text_spans(score: np.ndarray, fps: float, pad: float = 0.1, shortest: float = 0.15) -> list[list[float]]:
+    """``[[start, end], ...]`` where ``score`` (one value per frame, see :func:`text_presence`) shows text, one per
+    line shown: ``pad`` seconds wider on each side, and two lines that close to each other meet halfway between them
+    (no gap where the subtitle could show). Ones shorter than ``shortest`` (a flicker) are dropped."""
+    if not len(score):
+        return []
+    on = np.concatenate([[False], score > _text_threshold(score), [False]])
+    edges = np.flatnonzero(np.diff(on.astype(np.int8)))
+    spans: list[list[float]] = []
+    end_of_video = len(score) / fps
+    for a, b in zip(edges[::2], edges[1::2]):
+        if (b - a) / fps < shortest:
+            continue
+        start, end = max(a / fps - pad, 0.0), min(b / fps + pad, end_of_video)
+        if spans and start < spans[-1][1]:
+            spans[-1][1] = start = (spans[-1][1] - pad + start + pad) / 2
+        spans.append([start, end])
+    return [[round(float(a), 3), round(float(b), 3)] for a, b in spans]
+
+
+SUBTITLE_SIDE_PAD = 0.05  # a blur reaches this much (of the picture's width) past each end of its line
+SUBTITLE_SPANS_VERSION = 2  # what detect_subtitle_spans finds; cached results of another version are found again
+
+
+def text_extent(columns: np.ndarray) -> Optional[tuple[float, float]]:
+    """Where a line of text is across the picture, from :func:`text_columns` of the frames that show it:
+    ``(left, right)`` as fractions of the width looked at, or ``None``."""
+    profile = np.percentile(columns, 90, axis=0) if len(columns) > 1 else columns.reshape(-1)
+    if not profile.size or profile.max() <= 0:
+        return None
+    xs = np.flatnonzero(profile > float(profile.max()) * 0.15)
+    n = profile.size + 1
+    return float(xs.min()) / n, float(xs.max() + 2) / n
+
+
+def detect_subtitle_spans(video_path: str | Path, box: list[float], fps: float = SUBTITLE_SCAN_FPS) -> list[list[float]]:
+    """When and how wide subtitles burned into the video are on screen inside ``box`` (``[x, y, w, h]`` fractions
+    of the picture): ``[[start, end, x, w], ...]`` — :func:`find_text_spans` over the whole video, looked at ``fps``
+    times a second, and for each line the part of the picture's width it takes (centred, a little wider than the
+    line, never past ``box``)."""
+    info = probe_video(video_path)
+    width, height = info["width"], info["height"]
+    if not width or not height:
+        return []
+    x, y, w, h = (float(v) for v in box)
+    cw, ch = max(_even(width * w), 2), max(_even(height * h), 2)
+    cx, cy = min(_even(width * x), width - cw), min(_even(height * y), height - ch)
+    ow = 270
+    oh = max(_even(ch * ow / cw), 8)
+    raw = subprocess.run(
+        [_require_binary("ffmpeg"), "-v", "error", "-i", str(video_path), "-an", "-vf",
+         f"fps={fps},crop={cw}:{ch}:{cx}:{cy},scale={ow}:{oh}", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ).stdout
+    n = len(raw) // (ow * oh)
+    if not n:
+        return []
+    frames = np.frombuffer(raw[: n * ow * oh], np.uint8).reshape(n, oh, ow).astype(np.float32)
+    columns = text_columns(frames)
+    score = columns.mean(axis=1)
+    shown = score > _text_threshold(score)
+    left_edge, right_edge = cx / width, (cx + cw) / width
+    spans = []
+    for start, end in find_text_spans(score, fps):
+        frames_in = [i for i in range(int(start * fps), min(int(np.ceil(end * fps)), n)) if shown[i]]
+        extent = text_extent(columns[frames_in]) if frames_in else None
+        if extent is None:
+            lo, hi = left_edge, right_edge
+        else:
+            lo, hi = left_edge + extent[0] * (right_edge - left_edge), left_edge + extent[1] * (right_edge - left_edge)
+            # Centred like the subtitles are, so a line drawn a little off still fits.
+            half = max(0.5 - lo, hi - 0.5, 0.05) + SUBTITLE_SIDE_PAD
+            lo, hi = max(0.5 - half, left_edge), min(0.5 + half, right_edge)
+        spans.append([start, end, round(lo, 4), round(hi - lo, 4)])
+    return spans
+
+
 def _even(v: float) -> int:
     return max(int(round(v / 2)) * 2, 2)
 
@@ -797,6 +894,11 @@ __all__ = [
     "detect_subtitle_box",
     "ensure_subtitle_box",
     "find_subtitle_box",
+    "detect_subtitle_spans",
+    "find_text_spans",
+    "text_presence",
+    "text_columns",
+    "text_extent",
     "subtitle_parts",
     "subtitle_filter",
     "subtitle_overlays",

@@ -190,6 +190,45 @@ def test_find_subtitle_box_finds_the_burned_in_line():
     assert video_editor.find_subtitle_box(np.stack([_frame_with_subtitle(i, text=False) for i in range(20)])) is None
 
 
+def test_find_text_spans_gives_one_span_per_line_and_drops_flickers():
+    fps = 10
+    score = np.zeros(100)
+    score[10:20] = 5.0  # 1.0–2.0 s
+    score[21:30] = 9.0  # 2.1–3.0 s: the next line right after it — they meet halfway, no gap
+    score[50:51] = 9.0  # one frame: a flicker, dropped
+    score[60:75] = 1.6  # a short faint line still counts
+    score[80:90] = 0.3  # noise in the picture does not
+    assert video_editor.find_text_spans(score, fps) == [[0.9, 2.05], [2.05, 3.1], [5.9, 7.6]]
+    assert video_editor.find_text_spans(np.zeros(50), fps) == []
+
+
+def test_detect_subtitle_spans_finds_when_and_how_wide_burned_in_text_is_shown(tmp_path):
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg is not installed")
+    video = tmp_path / "subbed.mp4"
+    # White strokes (like letters) at the bottom: a short line (x 120–240 of 360) from 0.5 to 1.5 s, a long one
+    # (x 40–320) from 2.5 to 3.2 s.
+    short = [f"drawbox=x={120 + 10 * i}:y=500:w=6:h=40:color=white:t=fill:enable='between(t,0.5,1.5)'" for i in range(12)]
+    long = [f"drawbox=x={40 + 10 * i}:y=500:w=6:h=40:color=white:t=fill:enable='between(t,2.5,3.2)'" for i in range(28)]
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=0x404040:size=360x640:rate=25", "-t", "4",
+                    "-vf", ",".join(short + long), "-pix_fmt", "yuv420p", str(video)], check=True)
+    spans = video_editor.detect_subtitle_spans(video, [0.02, 0.75, 0.96, 0.1])
+    assert len(spans) == 2
+    (a0, b0, x0, w0), (a1, b1, x1, w1) = spans
+    assert abs(a0 - 0.4) <= 0.15 and abs(b0 - 1.6) <= 0.15
+    assert abs(a1 - 2.4) <= 0.15 and abs(b1 - 3.3) <= 0.15
+    # Each blur fits its own line: centred, covering it, not much wider.
+    assert x0 < 120 / 360 and x0 + w0 > 246 / 360 and w0 < 0.5
+    assert x1 < 40 / 360 and x1 + w1 > 316 / 360 and w1 > 0.75
+    assert abs(x0 + w0 / 2 - 0.5) < 0.01 and abs(x1 + w1 / 2 - 0.5) < 0.01
+    assert video_editor.detect_subtitle_spans(video, [0.02, 0.1, 0.96, 0.1]) == []  # nothing there
+
+
 def test_subtitle_filter_stays_inside_the_picture():
     assert video_editor.subtitle_filter("off", [0.1, 0.7, 0.8, 0.1], 1080, 1920) is None
     fill = video_editor.subtitle_filter("fill", [0.0, 0.9, 1.0, 0.2], 1080, 1920)
