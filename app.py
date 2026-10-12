@@ -174,16 +174,8 @@ DEFAULT_TARGET_TEXT = (
 )
 
 _CUSTOM_CSS = """
-.logo-container {
-    text-align: center;
-    margin: 0.5rem 0 1rem 0;
-}
-.logo-container img {
-    height: 80px;
-    width: auto;
-    max-width: 200px;
-    display: inline-block;
-}
+/* No Gradio footer ("Use via API · Built with Gradio · Settings"). */
+footer { display: none !important; }
 
 /* Toggle switch style */
 .switch-toggle {
@@ -1815,12 +1807,8 @@ def create_demo_interface(demo: VoxCPMDemo):
             logger.warning(f"ASR recognition failed: {e}")
             return gr.update(value="")
 
-    with gr.Blocks() as interface:
-        gr.HTML(
-            '<div class="logo-container">'
-            '<img src="/gradio_api/file=assets/voxcpm_logo.png" alt="VoxCPM Logo">'
-            "</div>"
-        )
+    # Full width so every tab (the video editor most of all) uses the whole screen.
+    with gr.Blocks(fill_width=True) as interface:
 
         with gr.Tabs() as tabs:
             with gr.Tab(I18N("tab_tts"), id="tts"):
@@ -1974,6 +1962,7 @@ def run_demo(
         server_port=server_port,
         show_error=show_error,
         i18n=I18N,
+        footer_links=[],
         theme=_APP_THEME,
         css=_CUSTOM_CSS + (_EDITOR_ASSETS / "editor.css").read_text(encoding="utf-8"),
         # Projects and the voice templates (played in the page) are served from where they are kept.
