@@ -804,7 +804,8 @@ STARTER_VOICES = [
      "description": "Child voice actor, a boy of about ten, clearly a boy, boyish and energetic, slightly husky, not "
                     "girlish, clear diction"},
     {"name": "Girl", "gender": "female", "age": "kid",
-     "description": "Child voice actress, a girl of about ten, sweet, bright and lively, clearly a girl, clear diction"},
+     "description": "Child voice actress, a girl of about ten, crisp and very clear, bright and sweet, clean "
+                    "close-microphone studio recording, precise clear diction, clearly a girl"},
     {"name": "Kid", "gender": "unknown", "age": "kid",
      "description": "Child voice actor of about eight, bright, playful and clear"},
     {"name": "Narrator", "gender": "unknown", "age": "adult",

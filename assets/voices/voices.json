@@ -59,9 +59,9 @@
   "file": "Girl.wav",
   "gender": "female",
   "age": "kid",
-  "description": "Child voice actress, a girl of about ten, sweet, bright and lively, clearly a girl, clear diction",
+  "description": "Child voice actress, a girl of about ten, crisp and very clear, bright and sweet, clean close-microphone studio recording, precise clear diction, clearly a girl",
   "starter": true,
-  "pitch_hz": 286.8
+  "pitch_hz": 277.1
  },
  "Kid": {
   "file": "Kid.wav",
