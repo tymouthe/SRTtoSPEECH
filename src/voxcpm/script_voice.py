@@ -775,6 +775,8 @@ def failed_lines(report: list[dict]) -> list[int]:
 AUTO_VOICE = "auto"  # no template: the voice is designed from the speaker's first line(s)
 UPLOADED_DESCRIPTION = "Uploaded clip"  # a recording, not made by VoxCPM: denoised before it is copied
 VOICE_LIBRARY_DIR = Path(os.environ.get("VOXCPM_VOICES_DIR", Path.home() / ".voxcpm" / "voices"))
+# The starter templates kept in the repo: copied into an empty library, so a fresh setup has voices to pick from.
+BUNDLED_VOICES_DIR = Path(__file__).resolve().parents[2] / "assets" / "voices"
 # What a template says (calm and neutral, about 6 s): "Hello, I am glad to meet you today. Let's start our story
 # together." Every line of a speaker copies the voice of this clip and adds its own emotion.
 TEMPLATE_TEXT = "សួស្តី ខ្ញុំរីករាយណាស់ដែលបានជួបអ្នកនៅថ្ងៃនេះ។ តោះយើងចាប់ផ្តើមរឿងរបស់យើងទាំងអស់គ្នា។"
@@ -812,7 +814,22 @@ STARTER_VOICES = [
 
 
 def _library(directory=None) -> Path:
-    return Path(directory) if directory else VOICE_LIBRARY_DIR
+    if directory:
+        return Path(directory)
+    _seed_library(VOICE_LIBRARY_DIR)
+    return VOICE_LIBRARY_DIR
+
+
+def _seed_library(folder: Path) -> None:
+    """Copy the bundled templates into ``folder`` when it has no library yet (a deleted template stays deleted)."""
+    import shutil
+
+    if (folder / "voices.json").exists() or not (BUNDLED_VOICES_DIR / "voices.json").exists():
+        return
+    folder.mkdir(parents=True, exist_ok=True)
+    for clip in BUNDLED_VOICES_DIR.glob("*.wav"):
+        shutil.copyfile(clip, folder / clip.name)
+    shutil.copyfile(BUNDLED_VOICES_DIR / "voices.json", folder / "voices.json")
 
 
 def load_voice_library(directory=None) -> dict[str, dict]:

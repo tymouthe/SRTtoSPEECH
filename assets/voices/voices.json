@@ -1,0 +1,82 @@
+{
+ "Man": {
+  "file": "Man.wav",
+  "gender": "male",
+  "age": "adult",
+  "description": "Professional male voice actor for film dubbing, adult man, deep, rich and resonant, clear diction, natural and expressive",
+  "starter": true,
+  "pitch_hz": 140.1
+ },
+ "Woman": {
+  "file": "Woman.wav",
+  "gender": "female",
+  "age": "adult",
+  "description": "Professional female voice actor for film dubbing, adult woman, warm, smooth and expressive, clear diction, clearly feminine",
+  "starter": true,
+  "pitch_hz": 242.6
+ },
+ "Young man": {
+  "file": "Young_man.wav",
+  "gender": "male",
+  "age": "adult",
+  "description": "Young male voice actor in his twenties for film dubbing, clear and bright, confident, clearly masculine, natural and expressive",
+  "starter": true,
+  "pitch_hz": 132.3
+ },
+ "Young woman": {
+  "file": "Young_woman.wav",
+  "gender": "female",
+  "age": "adult",
+  "description": "Young female voice actor in her twenties for film dubbing, bright, sweet and lively, clear diction, clearly feminine, medium-high pitch",
+  "starter": true,
+  "pitch_hz": 233.0
+ },
+ "Old man": {
+  "file": "Old_man.wav",
+  "gender": "male",
+  "age": "adult",
+  "description": "Veteran male voice actor playing an elderly man of about seventy, deep and low, gravelly, slow and weighty, clearly masculine, not high-pitched",
+  "starter": true,
+  "pitch_hz": 136.5
+ },
+ "Old woman": {
+  "file": "Old_woman.wav",
+  "gender": "female",
+  "age": "adult",
+  "description": "Veteran female voice actor playing an elderly woman of about seventy, soft, slightly raspy, gentle and slow, clearly feminine",
+  "starter": true,
+  "pitch_hz": 239.8
+ },
+ "Boy": {
+  "file": "Boy.wav",
+  "gender": "male",
+  "age": "kid",
+  "description": "Young boy of about ten, clearly a boy, boyish and energetic, slightly husky, not girlish",
+  "starter": true,
+  "pitch_hz": 226.3
+ },
+ "Girl": {
+  "file": "Girl.wav",
+  "gender": "female",
+  "age": "kid",
+  "description": "Child voice actress, a girl of about ten, sweet, bright and lively, clearly a girl, clear diction",
+  "starter": true,
+  "pitch_hz": 286.8
+ },
+ "Kid": {
+  "file": "Kid.wav",
+  "gender": "unknown",
+  "age": "kid",
+  "description": "Child voice actor of about eight, bright, playful and clear",
+  "starter": true,
+  "pitch_hz": 351.1
+ },
+ "Narrator": {
+  "file": "Narrator.wav",
+  "gender": "unknown",
+  "age": "adult",
+  "description": "Professional narrator for film trailers and documentaries, warm, rich, calm and authoritative, clear diction",
+  "starter": true,
+  "pitch_hz": 145.9
+ }
+}
