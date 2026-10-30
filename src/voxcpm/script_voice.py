@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 AGES = ("adult", "kid")
 DEFAULT_SPEAKER = "Narrator"
+SAME_VOICE = 0.9  # two reference voices at least this close (speaker embeddings) are the same voice
 
 _GENDER_WORDS = {"male": "male", "m": "male", "man": "male", "female": "female", "f": "female", "woman": "female"}
 _AGE_WORDS = {"adult": "adult", "kid": "kid", "child": "kid", "children": "kid"}
@@ -520,6 +521,8 @@ class ScriptVoicer(VideoDubber):
             )):
                 if progress:
                     progress(0, len(lines), firsts[name])
+                if self.on_stage:
+                    self.on_stage(f"Designing {name}'s voice")
                 # A new voice for a speaker is designed with a new seed (round 0 is the first voice).
                 voice_round = int(state["voice_rounds"].get(name, -1)) + 1 if name in new_voices else int(
                     state["voice_rounds"].get(name, 0)
@@ -577,29 +580,45 @@ class ScriptVoicer(VideoDubber):
             others = []
             if target is not None:
                 for name, ref in refs.items():
-                    if name != line.speaker:
+                    # A speaker given the same voice (one template for two speakers) can't be told apart from
+                    # this one, so a line is never asked to sound unlike it.
+                    if name != line.speaker and ref != reference:
                         emb = self._embedding_of_file(ref)
-                        if emb is not None:
+                        if emb is not None and float(emb @ target) < SAME_VOICE:
                             others.append(emb)
-            # Each regeneration of a line uses new seeds (round 0 is the first generation).
-            round_ = int(state["rounds"].get(str(line.index), -1)) + 1
-            line_options = replace(options, seed=(options.seed or 0) + round_ * 104_729)
             own = accepted.get(line.speaker)
-            best = self._generate_best(
-                line,
-                profile,
-                mode,
-                reference,
-                target,
-                line_options,
-                others=others,
-                target_pitch=self._target_pitch(line, reference, None) if reference else None,
-                attempts=options.max_attempts,
-                min_similarity=max(options.min_voice_similarity, options.min_consistency) if reference else None,
-                peers=_centroid(own) if own else None,
-                pitch_range=None if reference else pitch_range(profile.gender, profile.age),
-                pitch_limits=pitch_limits(profile.gender, profile.age),
-            )
+            # Each regeneration of a line uses new seeds (round 0 is the first generation). A line that still
+            # fails after its tries gets another round, until it passes (or ``failed_line_rounds`` is reached).
+            round_ = int(state["rounds"].get(str(line.index), -1))
+            best, tries = None, 0
+            for extra_round in range(max(1, options.failed_line_rounds)):
+                round_ += 1
+                if extra_round and self.on_stage:
+                    self.on_stage(f"Line #{line.index} failed ({', '.join(best['issues'])}): retry round {extra_round + 1}")
+                line_options = replace(options, seed=(options.seed or 0) + round_ * 104_729)
+                candidate = self._generate_best(
+                    line,
+                    profile,
+                    mode,
+                    reference,
+                    target,
+                    line_options,
+                    others=others,
+                    target_pitch=self._target_pitch(line, reference, None) if reference else None,
+                    attempts=options.max_attempts,
+                    min_similarity=max(options.min_voice_similarity, options.min_consistency) if reference else None,
+                    peers=_centroid(own) if own else None,
+                    pitch_range=None if reference else pitch_range(profile.gender, profile.age),
+                    pitch_limits=pitch_limits(profile.gender, profile.age),
+                )
+                tries += candidate["tries"]
+                rank = lambda b: (b["voice_ok"] and b["gender_ok"], b["voice_ok"], b["gender_ok"], -len(b["issues"]))
+                if best is None or rank(candidate) > rank(best):
+                    best = candidate
+                if best["voice_ok"] and best["gender_ok"]:
+                    break
+                logger.info("Line #%d still failing after round %d: %s", line.index, extra_round + 1, best["issues"])
+            best["tries"] = tries
             if best["voice_ok"] and best.get("embedding") is not None:
                 accepted.setdefault(line.speaker, []).append(best["embedding"])
             if options.remove_silence:
@@ -631,6 +650,8 @@ class ScriptVoicer(VideoDubber):
         state["refs"] = refs
         state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
+        if self.on_stage:
+            self.on_stage("Building the combined track")
         # Combined track: lines keep their natural pace (sped up by at most ``max_speedup``, default 1.1 here,
         # which is inaudible); a line that is still too long pushes the following lines a little later
         # instead of being squeezed, since squeezing changes how the voice sounds.

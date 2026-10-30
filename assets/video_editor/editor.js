@@ -23,11 +23,7 @@ const S = {
   stretched: {}, // "line|speed" -> url of the line's audio at that speed (pitch kept), made on the server
 };
 let ctx = null;
-// New subtitles: { cues: [{ id, start, end, text }], burn: on/off, size: text height as a fraction of the picture }.
-S.subs = null;
-S.selCue = null;
 S.selBlur = null; // the selected part of the 🌫 Blur track
-const SUB_DEFAULTS = { burn: true, size: 0.034 };
 
 // ---------- small helpers ----------
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -109,14 +105,13 @@ function showError(e) {
 
 // ---------- loading the project ----------
 function computeDur() {
-  // The timeline ends where the video ends (it can't be scrolled past it) — or where the last clip, subtitle or blur
+  // The timeline ends where the video ends (it can't be scrolled past it) — or where the last clip or blur
   // ends if one goes past it. Without a video: the last line or clip, and a little room after it.
   let d = (S.data && S.data.video && S.data.video.duration) || 0;
   if (video.duration && isFinite(video.duration)) d = Math.max(d, video.duration);
   const media = d > 0;
   if (!media) { d = 5; S.lines.forEach((l) => { d = Math.max(d, l.end); }); }
   keys().forEach((k) => { d = Math.max(d, clipEnd(k)); });
-  (S.subs ? S.subs.cues : []).forEach((c) => { d = Math.max(d, c.end); });
   blurParts().forEach((p) => { d = Math.max(d, p.end); });
   return media ? d : d + 2;
 }
@@ -131,13 +126,6 @@ function applyPayload(p) {
   Object.assign(S.mix, p.mix || {});
   S.sel = new Set(selKeys());
   S.edits = {};
-  S.subs = p.subtitles && Array.isArray(p.subtitles.cues) ? Object.assign({}, SUB_DEFAULTS, p.subtitles) : null;
-  if (!S.subs && S.lines.some((l) => l.url) && p.clips) {
-    // First time with generated lines: one subtitle per line, on its voice's time.
-    S.subs = Object.assign({}, SUB_DEFAULTS, { cues: subsFromVoices() });
-    clearTimeout(S.saveTimer); S.saveTimer = setTimeout(save, 600);
-  }
-  if (S.selCue && !cueById(S.selCue)) S.selCue = null;
   const v = p.video;
   if (v && v.url) {
     if (video.dataset.src !== v.url) {
@@ -163,13 +151,12 @@ function applyPayload(p) {
   q('subs-group').style.display = v && v.has_video !== false ? '' : 'none';
   q('orig-gain').value = S.mix.original_gain_db || 0;
   showOriginalToggle();
-  showCaptionsButton();
   showLevelButton();
   q('voc-gain').value = S.mix.vocals_gain_db || 0;
   if (!S.lines.length) {
-    setBanner('No lines yet — upload an SRT on the <b>📝 SRT → Speech</b> tab, click <b>Analyze</b> and <b>Generate</b>; then come back here.');
+    setBanner('No lines yet — upload an SRT on the <b>① Script</b> step, click <b>Analyze</b>, then <b>Generate</b> on step <b>③</b>; then come back here.');
   } else if (!S.lines.some((l) => l.url)) {
-    setBanner('None of the lines has been generated yet — click <b>Generate all lines</b> on the <b>📝 SRT → Speech</b> tab first.');
+    setBanner('None of the lines has been generated yet — click <b>Generate all lines</b> on the <b>③ Generate</b> step first.');
   } else {
     setBanner('');
   }
@@ -303,16 +290,6 @@ function render() {
     '</div><div class="vxe-lane" data-lane="ruler" style="width:' + W + 'px"></div></div>';
   const v = S.data && S.data.video;
   if (v && v.has_video !== false) {
-    const cues = S.subs ? S.subs.cues : [];
-    const subRows = cueRows();
-    let subGuides = '';
-    for (let r = 1; r < subRows; r++) subGuides += '<div class="vxe-rowline" style="top:' + (r * CUE_ROW + 2) + 'px"></div>';
-    html += '<div class="vxe-trackrow vxe-subs" style="height:' + (subRows * CUE_ROW + 6) + 'px"><div class="vxe-head"><div class="vxe-head-name">💬 Subtitles' +
-      (subRows > 1 ? ' <span style="color:var(--vxe-dim);font-weight:400;font-size:11px">' + subRows + ' rows</span>' : '') + '</div>' +
-      '<div class="vxe-head-tools"><button data-act="subs-burn" class="' + (subsOn() ? '' : 'vxe-on-m') +
-      '" title="Turn the new subtitles off / on (preview and export)">M</button><button data-act="cue-add" title="Add a subtitle at the playhead (N)">+</button>' +
-      '<button data-act="subs-panel" title="Subtitle settings">⚙ ' + cues.length + '</button></div></div>' +
-      '<div class="vxe-lane" data-lane="subs" style="width:' + W + 'px">' + subGuides + cues.map(cueHtml).join('') + '</div></div>';
     const parts = blurParts();
     html += '<div class="vxe-trackrow vxe-blurtrack"><div class="vxe-head"><div class="vxe-head-name">🌫 Blur</div>' +
       '<div class="vxe-head-tools"><button data-act="blur-toggle" class="' + (blurOn() ? '' : 'vxe-on-m') +
@@ -446,13 +423,11 @@ function updateClipEl(key) {
 }
 
 function renderSelection() {
-  if (S.sel.size) { S.selCue = null; S.selSec = null; }
-  if (S.selCue) S.selSec = null;
-  if (S.sel.size || S.selCue || S.selSec != null) S.selBlur = null;
+  if (S.sel.size) S.selSec = null;
+  if (S.sel.size || S.selSec != null) S.selBlur = null;
   if (!S.selBlur) S.editSubs = false;
   content.querySelectorAll('[data-blur]').forEach((el) => el.classList.toggle('vxe-selected', el.dataset.blur === S.selBlur));
   content.querySelectorAll('[data-osec]').forEach((el) => el.classList.toggle('vxe-selected', +el.dataset.osec === S.selSec));
-  content.querySelectorAll('[data-cue]').forEach((el) => el.classList.toggle('vxe-selected', el.dataset.cue === S.selCue));
   content.querySelectorAll('[data-clip]').forEach((el) => el.classList.toggle('vxe-selected', S.sel.has(el.dataset.clip)));
   const lines = selLines();
   content.querySelectorAll('[data-slot]').forEach((el) => el.classList.toggle('vxe-sel', lines.includes(+el.dataset.slot)));
@@ -464,7 +439,6 @@ function updatePlayhead(t) {
   const ph = content.querySelector('[data-role="playhead"]');
   if (ph) ph.style.left = (HEAD + tToX(t)) + 'px';
   q('time').textContent = fmt(t);
-  drawPreviewSubs(t);
 }
 
 function setZoom(pps, anchorT, clientX) {
@@ -478,7 +452,7 @@ function setZoom(pps, anchorT, clientX) {
 }
 
 // ---------- edits, undo, save ----------
-const snapshot = () => JSON.stringify({ clips: S.clips, tracks: S.tracks, subs: S.subs, secs: S.mix.orig_sections || null,
+const snapshot = () => JSON.stringify({ clips: S.clips, tracks: S.tracks, secs: S.mix.orig_sections || null,
   blur: S.mix.subs ? { mode: S.mix.subs.mode, box: S.mix.subs.box, parts: S.mix.subs.parts } : null });
 function pushUndo(before) {
   S.undo.push(before || snapshot());
@@ -487,13 +461,12 @@ function pushUndo(before) {
 }
 function restore(snap) {
   const s = JSON.parse(snap);
-  S.clips = s.clips; S.tracks = s.tracks; S.subs = s.subs;
+  S.clips = s.clips; S.tracks = s.tracks;
   if (s.secs) S.mix.orig_sections = s.secs; else delete S.mix.orig_sections;
   if (s.blur) { S.mix.subs = Object.assign(S.mix.subs || {}, s.blur); q('subs-mode').value = S.mix.subs.mode || 'off'; }
   if (S.selBlur && !blurById(S.selBlur)) { S.selBlur = null; S.editSubs = false; }
   if (S.selSec != null && S.selSec >= sections().length) S.selSec = null;
   S.sel = new Set(selKeys());
-  if (S.selCue && !cueById(S.selCue)) S.selCue = null;
   changed();
 }
 function undo() { if (S.undo.length) { S.redo.push(snapshot()); restore(S.undo.pop()); } }
@@ -511,7 +484,7 @@ function changed(keepInspector) {
 }
 async function save() {
   clearTimeout(S.saveTimer);
-  try { await call('editor_save', { clips: S.clips, mix: S.mix, tracks: S.tracks, subtitles: S.subs || undefined }); } catch (e) { showError(e); }
+  try { await call('editor_save', { clips: S.clips, mix: S.mix, tracks: S.tracks }); } catch (e) { showError(e); }
 }
 
 function bestRegion(l, taken) {
@@ -806,12 +779,10 @@ content.addEventListener('pointerdown', (e) => {
   if (secEl) {
     // A part of the original sound: select it (it does not move: it has to stay in time with the picture).
     seek(timeAtClientX(e.clientX));
-    S.selSec = +secEl.dataset.osec; S.sel.clear(); S.selCue = null; S.selBlur = null; S.panel = null;
+    S.selSec = +secEl.dataset.osec; S.sel.clear(); S.selBlur = null; S.panel = null;
     renderSelection();
     return;
   }
-  const cueEl = e.target.closest('[data-cue]');
-  if (cueEl) { startCueDrag(e, cueEl); return; }
   const blurEl = e.target.closest('[data-blur]');
   if (blurEl) { startBlurDrag(e, blurEl); return; }
   const el = e.target.closest('[data-clip]');
@@ -833,24 +804,14 @@ content.addEventListener('pointerdown', (e) => {
     const onUp = () => { lane.removeEventListener('pointermove', onMove); lane.removeEventListener('pointerup', onUp); };
     lane.addEventListener('pointermove', onMove);
     lane.addEventListener('pointerup', onUp);
-  } else if (!e.shiftKey && (S.sel.size || S.selCue || S.selSec != null || S.selBlur)) {
+  } else if (!e.shiftKey && (S.sel.size || S.selSec != null || S.selBlur)) {
     S.sel.clear();
-    S.selCue = null;
     S.selSec = null;
     S.selBlur = null;
     renderSelection();
   }
 });
 content.addEventListener('dblclick', (e) => {
-  const cueEl = e.target.closest('[data-cue]');
-  if (cueEl) {
-    seek(cueById(cueEl.dataset.cue).start);
-    const box = insp.querySelector('[data-cf="text"]');
-    if (box) { box.focus(); box.select(); }
-    return;
-  }
-  const lane = e.target.closest('[data-lane="subs"]');
-  if (lane) { addCue(timeAtClientX(e.clientX)); return; }
   const blurEl = e.target.closest('[data-blur]');
   if (blurEl) { seek(blurById(blurEl.dataset.blur).start); return; }
   if (e.target.closest('[data-lane="blur"]')) { addBlur(timeAtClientX(e.clientX)); return; }
@@ -873,10 +834,6 @@ content.addEventListener('click', (e) => {
     renderInspector();
   } else if (b.dataset.act === 'orig-mute') {
     toggleOriginal();
-  } else if (b.dataset.act === 'subs-burn') {
-    toggleSubs();
-  } else if (b.dataset.act === 'cue-add') {
-    addCue(now());
   } else if (b.dataset.act === 'blur-add') {
     addBlur(now());
   } else if (b.dataset.act === 'blur-match') {
@@ -890,9 +847,6 @@ content.addEventListener('click', (e) => {
       pushUndo(); subs.mode = subs.parts[0].mode || 'blur'; q('subs-mode').value = subs.mode; changed();
       setStatus('🌫 Blur on — the original subtitles are hidden during each blur on the track.');
     }
-  } else if (b.dataset.act === 'subs-panel') {
-    S.panel = 'subs';
-    renderInspector();
   }
 });
 
@@ -925,11 +879,6 @@ function showOriginalToggle() {
   q('mode').disabled = !on;
   const m = content.querySelector('[data-act="orig-mute"]');
   if (m) m.classList.toggle('vxe-on-m', !on);
-}
-function showCaptionsButton() {
-  const b = q('captions');
-  b.classList.toggle('vxe-primary', subsOn());
-  b.textContent = subsOn() ? '💬 Subtitles: on' : '💬 Subtitles: off';
 }
 function toggleOriginal() {
   S.mix.original_on = !originalOn();
@@ -1196,10 +1145,8 @@ const editTools =
 function renderInspector() {
   if (!S.data) { insp.innerHTML = '<div class="vxe-muted-note">Nothing loaded.</div>'; return; }
   if (S.panel === 'speech') return renderSpeechPanel();
-  if (S.panel === 'subs') return renderSubsPanel();
   if (S.panel === 'levels') return renderLevelsPanel();
   if (S.selSec != null && sections()[S.selSec]) return renderSectionPanel(S.selSec);
-  if (S.selCue && cueById(S.selCue)) return renderCuePanel(cueById(S.selCue));
   if (S.selBlur && blurById(S.selBlur)) return renderBlurPanel(blurById(S.selBlur));
   const sel = selKeys();
   if (sel.length === 1) return renderClipPanel(sel[0]);
@@ -1266,7 +1213,7 @@ function renderClipPanel(key) {
     field('Speaker', '<select data-e="speaker">' + speakers().map((n) => '<option' + (n === (edit.speaker || l.speaker) ? ' selected' : '') + '>' + esc(n) + '</option>').join('') + '</select>') +
     field('Emotion', '<input type="text" data-e="emotion" value="' + esc(edit.emotion != null ? edit.emotion : l.emotion) + '" placeholder="happy, sad, angry, … or any word">') +
     field('Tone', '<input type="text" data-e="tone" value="' + esc(edit.tone != null ? edit.tone : (l.tone || '')) +
-      '" placeholder="how it is said, e.g. louder and more forceful, speaking faster" title="Read from the original video when you added it on the SRT → Speech tab">') +
+      '" placeholder="how it is said, e.g. louder and more forceful, speaking faster" title="Read from the original video when you added it on the ① Script step">') +
     '<textarea data-e="text">' + esc(edit.text != null ? edit.text : l.text) + '</textarea>' +
     (Object.keys(edit).length ? '<div class="vxe-muted-note">✏️ Edited — click <b>Regenerate</b> to hear it.</div>' : '') +
     '<div class="vxe-actions">' +
@@ -1370,7 +1317,7 @@ function runAction(act) {
   }
   else if (act === 'speech-panel') { S.panel = 'speech'; renderInspector(); }
   else if (act === 'close-panel') { S.panel = null; renderInspector(); }
-  else if (act === 'levels-panel') { S.panel = 'levels'; S.sel.clear(); S.selCue = null; S.selSec = null; S.selBlur = null; render(); renderInspector(); }
+  else if (act === 'levels-panel') { S.panel = 'levels'; S.sel.clear(); S.selSec = null; S.selBlur = null; render(); renderInspector(); }
   else if (act === 'lv-reset') resetClipVolumes();
   else if (act === 'detect') detectAgain();
   else return false;
@@ -1429,7 +1376,7 @@ function startPolling() {
 // ---------- video ----------
 async function useVideoFile(file) {
   if (!file || S.busy) return;
-  if (!S.data) { showError('Generate the lines on the SRT → Speech tab first.'); return; }
+  if (!S.data) { showError('Generate the lines on the ③ Generate step first.'); return; }
   const isolate = q('isolate-upload').checked;
   try {
     busy('Uploading ' + file.name + '…');
@@ -1468,12 +1415,11 @@ async function doExport() {
   if (!S.data || !S.data.video) { showError('Add a video first.'); return; }
   pause();
   try {
-    const cleaning = ((blurOn() && blurParts().length) || (subsOn() && S.subs.cues.length)) && S.data.video.has_video !== false;
+    const cleaning = blurOn() && blurParts().length && S.data.video.has_video !== false;
     busy('Exporting: mixing the new voices onto the video…' + (S.mix.original === 'music' && !S.data.video.isolated ? ' Separating the music first can take a few minutes.' : '') +
       (cleaning ? ' Removing the subtitles from the picture re-encodes it at its original size (about half the video\'s length).' : ''));
     clearTimeout(S.saveTimer);
-    const overlays = await subtitleImages();
-    const r = await call('editor_export', { clips: S.clips, mix: S.mix, tracks: S.tracks, subtitles: S.subs || undefined, overlays: overlays });
+    const r = await call('editor_export', { clips: S.clips, mix: S.mix, tracks: S.tracks });
     const a = (url, name, label) => '<a href="' + esc(url) + '" download="' + esc(name) + '">' + label + '</a>';
     setStatus('✅ Exported: ' + (r.video_url ? a(r.video_url, r.video_name, '⬇ ' + esc(r.video_name)) + ' · ' : '') +
       a(r.soundtrack_url, r.soundtrack_name, '⬇ soundtrack (.wav)') + ' · ' + a(r.vocals_url, r.vocals_name, '⬇ new voices only (.wav)'));
@@ -1508,16 +1454,15 @@ function ensureBlur() {
 }
 const BLUR_EDGE = 0.02; // a placed blur reaches this close to the left and right edges of the picture
 function wideBox(box) {
-  // The same height, nearly the full width: subtitles of any length (and the new ones drawn there) stay covered.
+  // The same height, nearly the full width: subtitles of any length stay covered.
   return [BLUR_EDGE, box[1], r3(1 - 2 * BLUR_EDGE), box[3]];
 }
 function subtitleSpans() {
-  // When the subtitles are on screen: the new (Khmer) subtitles, else the lines' SRT times — a little wider than each
-  // one, and ones close together joined, so the original subtitle never peeks out between two of them.
+  // When the subtitles are on screen: the lines' SRT times — a little wider than each one, and ones close together
+  // joined, so the original subtitle never peeks out between two of them.
   const PAD = 0.1, JOIN = 0.2, len = videoLength() || S.dur;
-  const src = S.subs && S.subs.cues.length ? S.subs.cues : S.lines;
   const spans = [];
-  src.map((c) => [Math.max(c.start - PAD, 0), len > 0 ? Math.min(c.end + PAD, len) : c.end + PAD])
+  S.lines.map((c) => [Math.max(c.start - PAD, 0), len > 0 ? Math.min(c.end + PAD, len) : c.end + PAD])
     .filter(([a, b]) => b > a).sort((x, y) => x[0] - y[0])
     .forEach(([a, b]) => {
       const last = spans[spans.length - 1];
@@ -1546,7 +1491,7 @@ function matchBlursToSubtitles() {
   if (subs.mode === 'off') { subs.mode = subs.parts[0].mode; q('subs-mode').value = subs.mode; }
   S.selBlur = null; S.editSubs = false;
   changed();
-  setStatus('💬 ' + subs.parts.length + ' blur(s) placed over the subtitles — the original subtitles are hidden while each new one is shown. ' +
+  setStatus('💬 ' + subs.parts.length + ' blur(s) placed over the subtitles — the original subtitles are hidden while each line is spoken. ' +
     'Drag a blur or its edges to adjust it; select one and use ✏️ to move its area.');
 }
 function newBlurId() {
@@ -1572,7 +1517,7 @@ function blurHtml(p) {
     '<div class="vxe-clip-label">' + (BLUR_LABELS[mode] || '') + '</div></div>';
 }
 function selectBlur(id) {
-  S.selBlur = id; S.sel.clear(); S.selCue = null; S.selSec = null; S.panel = null;
+  S.selBlur = id; S.sel.clear(); S.selSec = null; S.panel = null;
   renderSelection();
 }
 function addBlur(t, quiet) {
@@ -1588,7 +1533,7 @@ function addBlur(t, quiet) {
   subs.parts.push(part);
   subs.parts.sort((a, b) => a.start - b.start);
   if (subs.mode === 'off') { subs.mode = part.mode; q('subs-mode').value = subs.mode; }
-  S.selBlur = part.id; S.sel.clear(); S.selCue = null; S.selSec = null; S.panel = null;
+  S.selBlur = part.id; S.sel.clear(); S.selSec = null; S.panel = null;
   changed();
   if (!quiet) setStatus('🌫 Blur added at ' + fmt(t) + ' — drag it or its edges on the 🌫 Blur track to change when it hides the subtitles; <b>✏️ Edit area</b> moves it on the picture.');
   return part;
@@ -1633,7 +1578,6 @@ function startBlurDrag(e, el) {
   const snaps = [now(), 0];
   if (videoLength()) snaps.push(videoLength());
   keys().forEach((k) => { if (audible(k)) snaps.push(S.clips[k].start, clipEnd(k)); });
-  (S.subs ? S.subs.cues : []).forEach((c) => snaps.push(c.start, c.end));
   blurParts().forEach((o) => { if (o.id !== id) snaps.push(o.start, o.end); });
   const snapTo = (t) => {
     let best = t, dist = 8 / S.pps;
@@ -1777,7 +1721,7 @@ async function originalSubtitleSpans(box) {
 q('subs-mode').addEventListener('change', async (e) => {
   const subs = ensureBlur(), mode = e.target.value, was = subs.mode;
   // From Kept to Blurred / Removed: the blurs are placed again, nearly the full width, one over each original subtitle
-  // found in the picture (none found: over each new subtitle). Undo brings back the ones there were. Between Blurred
+  // found in the picture (none found: over each line's time). Undo brings back the ones there were. Between Blurred
   // and Removed: every blur takes the new look.
   let found = [];
   const place = mode !== 'off' && (was === 'off' || !subs.parts.length);
@@ -1799,7 +1743,7 @@ q('subs-mode').addEventListener('change', async (e) => {
   changed(true);
   setStatus(mode === 'off' ? 'The subtitles in the picture are kept (the blurs stay on the 🌫 Blur track, switched off).' :
     'The subtitles in the picture are ' + (mode === 'fill' ? 'removed (filled in from around them)' : 'blurred') +
-    (placed ? ' — ' + subs.parts.length + ' blur(s) placed over ' + (found.length ? 'the original subtitles found in the picture, each as wide as its line' : 'the new subtitles (no original ones found in the blur area), nearly the full width') +
+    (placed ? ' — ' + subs.parts.length + ' blur(s) placed over ' + (found.length ? 'the original subtitles found in the picture, each as wide as its line' : 'each line\'s time (no original subtitles found in the blur area), nearly the full width') +
       ' (Undo brings back the ones before). ' :
       ' during each blur on the 🌫 Blur track — drag them to change when; select one and use ✏️ to move its area. ') +
     'The export re-encodes the video at its original size (about half its length to export).');
@@ -1822,338 +1766,6 @@ async function findSubtitles() {
     setStatus(r.found ? '🔍 Found the subtitles — the area is shown on the video; drag it or its corners to adjust, then ✏️ Area to finish.'
       : '🔍 No subtitles found in the picture. If there are some, use ✏️ Area and drag the box over them.');
   } catch (e) { showError(e); } finally { busy(''); }
-}
-
-// ---------- new subtitles ----------
-const SUB_FONT = '"Noto Sans Khmer", "Khmer Sangam MN", "Khmer MN", "Noto Sans", sans-serif';
-const cueById = (id) => (S.subs ? S.subs.cues.find((c) => c.id === id) : null);
-const subsOn = () => !!(S.subs && S.subs.burn !== false);
-function subsFromVoices() {
-  // One subtitle per line that is heard, from the start of its first piece to the end of its last.
-  const byLine = {};
-  keys().forEach((k) => {
-    if (!audible(k)) return;
-    const i = lineIdOf(k), a = S.clips[k].start, b = clipEnd(k);
-    const g = byLine[i] = byLine[i] || { start: a, end: b };
-    g.start = Math.min(g.start, a); g.end = Math.max(g.end, b);
-  });
-  const cues = Object.keys(byLine).map((i) => ({ start: r3(byLine[i].start), end: r3(byLine[i].end), text: S.lineMap[i].text, lane: 0 }))
-    .sort((a, b) => a.start - b.start).map((c, n) => Object.assign({ id: 'c' + (n + 1) }, c));
-  cues.forEach((c, n) => { while (cues.slice(0, n).some((o) => o.lane === c.lane && cuesOverlap(o, c))) c.lane++; });
-  return cues;
-}
-function newCueId() {
-  let n = (S.subs ? S.subs.cues.length : 0) + 1;
-  while (cueById('c' + n)) n++;
-  return 'c' + n;
-}
-function ensureSubs() {
-  if (!S.subs) S.subs = Object.assign({}, SUB_DEFAULTS, { cues: [] });
-  return S.subs;
-}
-function sortCues() { S.subs.cues.sort((a, b) => a.start - b.start); }
-const CUE_ROW = 30; // height of one row of the subtitle track
-const cueRows = () => Math.max(1, ...(S.subs ? S.subs.cues : []).map((c) => (c.lane || 0) + 1));
-const cuesOverlap = (a, b) => a.start < b.end - 0.01 && b.start < a.end - 0.01;
-function settleCues(keep, moving) {
-  // Subtitles that overlap on the same row move to a free row: ``keep`` stays where it was put, ``moving`` (one just
-  // dragged, added or split off) is the one that moves aside; empty rows are dropped. Row 1 is drawn at the usual
-  // place on the video, higher rows above it.
-  const rank = (c) => (c === keep ? -1 : c === moving ? 1 : 0);
-  const cues = S.subs.cues.slice().sort((a, b) => rank(a) - rank(b) || a.start - b.start);
-  const placed = [];
-  cues.forEach((c) => {
-    let lane = c.lane || 0;
-    const busy = (l) => placed.some((o) => (o.lane || 0) === l && cuesOverlap(o, c));
-    if (busy(lane)) { let l = 0; while (busy(l)) l++; lane = l; }
-    c.lane = lane;
-    placed.push(c);
-  });
-  const used = [...new Set(S.subs.cues.map((c) => c.lane || 0))].sort((a, b) => a - b);
-  S.subs.cues.forEach((c) => { c.lane = used.indexOf(c.lane || 0); });
-  sortCues();
-}
-function moveCueRow(id, d) {
-  const c = cueById(id);
-  if (!c) return;
-  pushUndo();
-  c.lane = Math.max(0, (c.lane || 0) + d);
-  // Moving onto a row where it overlaps something: the other subtitle takes this one's old row instead.
-  S.subs.cues.forEach((o) => { if (o !== c && (o.lane || 0) === c.lane && cuesOverlap(o, c)) o.lane = Math.max(0, c.lane - d); });
-  settleCues(c);
-  changed();
-}
-function cueHtml(c) {
-  return '<div class="vxe-cue' + (c.id === S.selCue ? ' vxe-selected' : '') + (c.text.trim() ? '' : ' vxe-empty') + '" data-cue="' + esc(c.id) +
-    '" title="' + esc(fmt(c.start) + ' → ' + fmt(c.end) + '\n' + c.text) + '" style="left:' + tToX(c.start) + 'px;width:' +
-    Math.max(tToX(c.end - c.start), 4) + 'px;top:' + (4 + (c.lane || 0) * CUE_ROW) + 'px;height:' + (CUE_ROW - 6) +
-    'px"><div class="vxe-handle vxe-l" data-h="l"></div><div class="vxe-handle vxe-r" data-h="r"></div>' +
-    '<div class="vxe-clip-label">' + esc(c.text || '(empty)') + '</div></div>';
-}
-function selectCue(id) {
-  S.selCue = id; S.sel.clear(); S.panel = null;
-  renderSelection();
-}
-function addCue(t) {
-  const subs = ensureSubs();
-  pushUndo();
-  // The text of the line heard there, if any; up to 2 s, stopping before the next subtitle.
-  const heard = byStart(keys().filter((k) => audible(k) && S.clips[k].start <= t + 0.01 && clipEnd(k) > t));
-  const next = subs.cues.filter((c) => c.start > t + 0.05).map((c) => c.start);
-  const end = Math.min(t + 2, next.length ? Math.min(...next) - 0.05 : t + 2);
-  const cue = { id: newCueId(), start: r3(t), end: r3(Math.max(end, t + 0.4)), text: heard.length ? lineOf(heard[0]).text : '' };
-  subs.cues.push(cue); settleCues(null, cue);
-  S.selCue = cue.id; S.sel.clear(); S.panel = null;
-  changed();
-  const box = insp.querySelector('[data-cf="text"]');
-  if (box) box.focus();
-  setStatus('💬 Subtitle added at ' + fmt(t) + ' — type its text on the right; drag it or its edges on the track to change its time.');
-}
-function deleteCue(id) {
-  if (!cueById(id)) return;
-  pushUndo();
-  S.subs.cues = S.subs.cues.filter((c) => c.id !== id);
-  S.selCue = null;
-  changed();
-}
-function splitCueAt(id, t) {
-  const c = cueById(id);
-  if (!c || t <= c.start + 0.2 || t >= c.end - 0.2) { setStatus('✂ Put the playhead inside the subtitle (not at its very edge) to split it there.'); return; }
-  pushUndo();
-  const [a, b] = splitWords(c.text, (t - c.start) / (c.end - c.start));
-  const second = { id: newCueId(), start: r3(t), end: c.end, text: b };
-  c.end = r3(t); c.text = a;
-  S.subs.cues.push(second); settleCues(c, second);
-  S.selCue = second.id;
-  changed();
-}
-function splitWords(text, frac) {
-  // At the word boundary nearest to frac of the text (Intl.Segmenter knows Khmer words).
-  const target = text.length * clamp(frac, 0, 1);
-  let cuts = [];
-  try { for (const p of new Intl.Segmenter(undefined, { granularity: 'word' }).segment(text)) if (p.index > 0) cuts.push(p.index); } catch (e) { /* none */ }
-  if (!cuts.length) return [text, ''];
-  const at = cuts.reduce((best, x) => (Math.abs(x - target) < Math.abs(best - target) ? x : best), cuts[0]);
-  return [text.slice(0, at).trim(), text.slice(at).trim()];
-}
-function toggleSubs() {
-  ensureSubs();
-  S.subs.burn = !subsOn();
-  if (S.subs.burn && !S.subs.cues.length && S.lines.some((l) => l.url)) S.subs.cues = subsFromVoices();
-  showCaptionsButton();
-  changed(true);
-  setStatus(subsOn() ? '💬 New subtitles on — shown on the video ' + (S.mix.subs && S.mix.subs.mode !== 'off' ? 'where the original ones were removed' : 'near the bottom') + ', and burned into the export.'
-    : '💬 New subtitles off — not shown and not in the export (they are kept on the track).');
-}
-function rebuildSubs() {
-  if (S.subs && S.subs.cues.length && !window.confirm('Make the subtitles again from the voices? Your subtitle edits are replaced (Undo brings them back).')) return;
-  pushUndo();
-  ensureSubs().cues = subsFromVoices();
-  S.selCue = null;
-  changed();
-  setStatus('↻ ' + S.subs.cues.length + ' subtitles made from the voices.');
-}
-
-function startCueDrag(e, el) {
-  const id = el.dataset.cue, c = cueById(id), handle = e.target.dataset.h;
-  if (S.selCue !== id) selectCue(id);
-  const before = snapshot(), c0 = Object.assign({}, c), x0 = e.clientX, y0 = e.clientY;
-  let moved = false;
-  el.setPointerCapture(e.pointerId);
-  const snaps = [now()];
-  keys().forEach((k) => { if (audible(k)) snaps.push(S.clips[k].start, clipEnd(k)); });
-  S.subs.cues.forEach((o) => { if (o.id !== id) snaps.push(o.start, o.end); });
-  const snapTo = (t) => {
-    let best = t, dist = 8 / S.pps;
-    snaps.forEach((p) => { if (Math.abs(p - t) < dist) { dist = Math.abs(p - t); best = p; } });
-    return best;
-  };
-  const onMove = (ev) => {
-    if (!moved && Math.abs(ev.clientX - x0) < 3 && Math.abs(ev.clientY - y0) < 6) return;
-    moved = true;
-    const dt = (ev.clientX - x0) / S.pps, snapOn = q('snap').checked && !ev.altKey;
-    const len = c0.end - c0.start;
-    if (!handle) {
-      let start = Math.max(0, c0.start + dt);
-      if (snapOn) { const s1 = snapTo(start), s2 = snapTo(start + len) - len; start = Math.abs(s1 - start) <= Math.abs(s2 - start) ? s1 : s2; }
-      c.start = r3(Math.max(0, start)); c.end = r3(c.start + len);
-      // Up / down: to another row (a new one below the last too).
-      c.lane = clamp((c0.lane || 0) + Math.round((ev.clientY - y0) / CUE_ROW), 0, 7);
-      el.style.top = (4 + c.lane * CUE_ROW) + 'px';
-    } else if (handle === 'l') {
-      let start = c0.start + dt;
-      if (snapOn) start = snapTo(start);
-      c.start = r3(clamp(start, 0, c.end - 0.2));
-    } else {
-      let end = c0.end + dt;
-      if (snapOn) end = snapTo(end);
-      c.end = r3(Math.max(end, c.start + 0.2));
-    }
-    el.style.left = tToX(c.start) + 'px';
-    el.style.width = Math.max(tToX(c.end - c.start), 4) + 'px';
-    q('time').textContent = fmt(handle === 'r' ? c.end : c.start);
-    drawPreviewSubs(now(), true);
-  };
-  const onUp = () => {
-    el.removeEventListener('pointermove', onMove);
-    el.removeEventListener('pointerup', onUp);
-    el.removeEventListener('pointercancel', onUp);
-    if (!moved) return;
-    pushUndo(before);
-    if ((c.lane || 0) !== (c0.lane || 0)) {
-      // Dragged to another row: what it lands on there takes its old row (a swap), it stays where it was put.
-      S.subs.cues.forEach((o) => { if (o !== c && (o.lane || 0) === c.lane && cuesOverlap(o, c)) o.lane = c0.lane || 0; });
-      settleCues(c);
-    } else settleCues(null, c);
-    changed();
-  };
-  el.addEventListener('pointermove', onMove);
-  el.addEventListener('pointerup', onUp);
-  el.addEventListener('pointercancel', onUp);
-}
-
-function renderCuePanel(c) {
-  insp.innerHTML = '<h3>💬 Subtitle</h3>' +
-    field('Starts at', '<input type="number" step="0.01" min="0" data-cf="start" value="' + c.start.toFixed(2) + '"> s') +
-    field('Ends at', '<input type="number" step="0.01" min="0" data-cf="end" value="' + c.end.toFixed(2) + '"> s · ' + (c.end - c.start).toFixed(2) + ' s long') +
-    '<textarea data-cf="text" placeholder="Subtitle text (Enter for a new line)">' + esc(c.text) + '</textarea>' +
-    '<div class="vxe-actions"><button class="vxe-btn" data-act="cue-play">▶ Play</button>' +
-    '<button class="vxe-btn" data-act="cue-split" title="Split it in two at the playhead">✂ Split at playhead</button>' +
-    '<button class="vxe-btn" data-act="cue-up" title="Row up (Alt+↑) — drawn lower on the video">⬆ Row up</button>' +
-    '<button class="vxe-btn" data-act="cue-down" title="Row down (Alt+↓) — drawn higher on the video">⬇ Row down</button>' +
-    '<button class="vxe-btn" data-act="cue-add-here">+ New subtitle at playhead</button>' +
-    '<button class="vxe-btn" data-act="cue-del" title="Delete">🗑 Delete</button></div>' +
-    '<div class="vxe-muted-note">Drag it on the 💬 Subtitles track to move it, its edges to change when it starts or ends. ' +
-    'It is drawn on the video ' + (S.mix.subs && S.mix.subs.mode !== 'off' ? 'where the original subtitles were removed' : 'near the bottom') +
-    '. Subtitles that overlap in time go on separate rows (drag up/down): row ' + ((c.lane || 0) + 1) + ' of ' + cueRows() +
-    '; a higher row is drawn above the lower ones.</div>';
-}
-function renderSubsPanel() {
-  const subs = ensureSubs();
-  insp.innerHTML = '<h3>💬 Subtitles</h3>' +
-    field('', '<label class="vxe-check"><input type="checkbox" data-sf="burn"' + (subsOn() ? ' checked' : '') + '> Show them on the video (preview and export)</label>') +
-    field('Text size', '<input type="range" min="0.02" max="0.06" step="0.002" data-sf="size" value="' + subs.size + '"> <span data-role="size-val">' + Math.round(subs.size * 1000) / 10 + '% of the height</span>') +
-    field('Where', S.mix.subs && S.mix.subs.mode !== 'off' ? 'Over the removed original subtitles (move it with ✏️ Area)' : 'Near the bottom (remove the original subtitles to put them in their place)') +
-    field('Count', subs.cues.length + ' subtitle(s)') +
-    '<div class="vxe-actions"><button class="vxe-btn" data-act="subs-rebuild" title="One subtitle per voice line, on its time">↻ Make again from the voices</button>' +
-    '<button class="vxe-btn" data-act="close-panel">Close</button></div>' +
-    '<div class="vxe-muted-note">Add one: double-click the track, the + button, or N. Edit one: click it. Remove one: select it and press Delete.</div>';
-}
-insp.addEventListener('input', (e) => {
-  const cf = e.target.dataset.cf, sf = e.target.dataset.sf;
-  if (cf === 'text' && S.selCue) {
-    if (!S.pendingUndo) S.pendingUndo = snapshot();
-    cueById(S.selCue).text = e.target.value;
-    const label = content.querySelector('[data-cue="' + CSS.escape(S.selCue) + '"] .vxe-clip-label');
-    if (label) label.textContent = e.target.value || '(empty)';
-    drawPreviewSubs(now(), true);
-  } else if (sf === 'size') {
-    if (!S.pendingUndo) S.pendingUndo = snapshot();
-    S.subs.size = +e.target.value;
-    insp.querySelector('[data-role="size-val"]').textContent = Math.round(S.subs.size * 1000) / 10 + '% of the height';
-    drawPreviewSubs(now(), true);
-  }
-});
-insp.addEventListener('change', (e) => {
-  const cf = e.target.dataset.cf, sf = e.target.dataset.sf;
-  if (cf && S.selCue) {
-    const c = cueById(S.selCue);
-    if (cf === 'text') { pushUndo(S.pendingUndo); S.pendingUndo = null; changed(true); return; }
-    pushUndo();
-    if (cf === 'start') c.start = r3(clamp(+e.target.value || 0, 0, c.end - 0.2));
-    if (cf === 'end') c.end = r3(Math.max(+e.target.value || 0, c.start + 0.2));
-    settleCues(null, c); changed();
-  } else if (sf === 'size') { pushUndo(S.pendingUndo); S.pendingUndo = null; changed(true); }
-  else if (sf === 'burn') toggleSubs();
-});
-insp.addEventListener('click', (e) => {
-  const b = e.target.closest('[data-act]');
-  if (!b || (!b.dataset.act.startsWith('cue-') && !b.dataset.act.startsWith('subs-'))) return;
-  const act = b.dataset.act;
-  if (act === 'cue-play' && S.selCue) { seek(cueById(S.selCue).start); play(); }
-  else if (act === 'cue-split' && S.selCue) splitCueAt(S.selCue, now());
-  else if (act === 'cue-add-here') addCue(now());
-  else if (act === 'cue-del' && S.selCue) deleteCue(S.selCue);
-  else if (act === 'cue-up' && S.selCue) moveCueRow(S.selCue, -1);
-  else if (act === 'cue-down' && S.selCue) moveCueRow(S.selCue, 1);
-  else if (act === 'subs-rebuild') rebuildSubs();
-});
-
-// Drawing: the same layout for the preview (canvas over the picture) and the export (one image per subtitle).
-const measure = document.createElement('canvas').getContext('2d');
-function subLayout(text, W, H) {
-  const px = Math.max(Math.round(H * (S.subs ? S.subs.size : SUB_DEFAULTS.size)), 8);
-  const font = '600 ' + px + 'px ' + SUB_FONT;
-  measure.font = font;
-  const maxW = W * 0.9, lines = [];
-  String(text || '').split('\n').forEach((para) => {
-    let words = [];
-    try { words = [...new Intl.Segmenter(undefined, { granularity: 'word' }).segment(para)].map((p) => p.segment); } catch (e) { words = para.split(/(\s+)/); }
-    let line = '';
-    words.forEach((w) => {
-      if (line && measure.measureText(line + w).width > maxW) { lines.push(line.trim()); line = w.trimStart(); } else line += w;
-    });
-    if (line.trim()) lines.push(line.trim());
-  });
-  const lineH = Math.round(px * 1.45);
-  const box = S.mix.subs && S.mix.subs.mode !== 'off' && S.mix.subs.box ? S.mix.subs.box : null;
-  const cy = box ? (box[1] + box[3] / 2) * H : H * 0.86;
-  return { font, px, lines, lineH, cy, W, H };
-}
-function drawLayout(g, L, shift) {
-  g.font = L.font; g.textAlign = 'center'; g.textBaseline = 'middle'; g.lineJoin = 'round';
-  const top = L.cy - (L.lines.length * L.lineH) / 2 - (shift || 0);
-  L.lines.forEach((line, i) => {
-    const y = top + i * L.lineH + L.lineH / 2;
-    g.lineWidth = Math.max(L.px * 0.18, 2); g.strokeStyle = 'rgba(0,0,0,0.92)'; g.strokeText(line, L.W / 2, y);
-    g.fillStyle = '#ffffff'; g.fillText(line, L.W / 2, y);
-  });
-}
-function cueShift(c, L) {
-  // How far above the usual place a subtitle is drawn: the lowest row showing with it sits at the usual place,
-  // each higher row right on top of the one below (so a subtitle on a higher row never covers a lower one).
-  const below = S.subs.cues.filter((o) => o !== c && o.text.trim() && (o.lane || 0) < (c.lane || 0) && cuesOverlap(o, c))
-    .sort((a, b) => (a.lane || 0) - (b.lane || 0));
-  if (!below.length) return 0;
-  const height = (o) => { const ol = o === c ? L : subLayout(o.text, L.W, L.H); return ol.lines.length * ol.lineH; };
-  const gap = L.px * 0.3;
-  return height(below[0]) / 2 + below.slice(1).reduce((sum, o) => sum + height(o), 0) + gap * below.length + height(c) / 2;
-}
-const subCanvas = q('subcanvas');
-let subDrawn = '';
-function drawPreviewSubs(t, force) {
-  const r = hasVideo() && subsOn() ? videoRect() : null;
-  const cues = r ? S.subs.cues.filter((c) => c.text.trim() && c.start <= t && c.end > t) : [];
-  const key = r && cues.length ? [r.x, r.y, r.w, r.h, S.subs.size, JSON.stringify(S.mix.subs), cues.map((c) => c.id + c.text).join('|')].join(';') : '';
-  if (key === subDrawn && !force) return;
-  subDrawn = key;
-  if (!key) { subCanvas.style.display = 'none'; return; }
-  const W = video.videoWidth, Hh = video.videoHeight, dpr = window.devicePixelRatio || 1;
-  Object.assign(subCanvas.style, { display: 'block', left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
-  subCanvas.width = Math.round(r.w * dpr); subCanvas.height = Math.round(r.h * dpr);
-  const g = subCanvas.getContext('2d');
-  g.setTransform(subCanvas.width / W, 0, 0, subCanvas.height / Hh, 0, 0);
-  cues.forEach((c) => { const L = subLayout(c.text, W, Hh); drawLayout(g, L, cueShift(c, L)); });
-}
-async function subtitleImages() {
-  // Each subtitle as a PNG band at the video's own size, with when and where the export puts it.
-  if (!subsOn() || !hasVideo()) return [];
-  const W = video.videoWidth, H = video.videoHeight;
-  if (!W || !H) return [];
-  try { await document.fonts.ready; } catch (e) { /* ignore */ }
-  const out = [];
-  S.subs.cues.filter((c) => c.text.trim() && c.end > c.start).forEach((c) => {
-    const L = subLayout(c.text, W, H), shift = cueShift(c, L);
-    const bandH = Math.ceil(L.lines.length * L.lineH + L.px);
-    const top = clamp(Math.round(L.cy - shift - bandH / 2), 0, Math.max(H - bandH, 0));
-    const cv = document.createElement('canvas');
-    cv.width = W; cv.height = bandH;
-    const g = cv.getContext('2d');
-    g.translate(0, -top);
-    drawLayout(g, L, shift);
-    out.push({ start: c.start, end: c.end, x: 0, y: top, png: cv.toDataURL('image/png').split(',')[1] });
-  });
-  return out;
 }
 
 // ---------- the original sound as parts (cut, volume, sound per part) ----------
@@ -2318,7 +1930,7 @@ insp.addEventListener('click', (e) => {
   if (!row) return;
   const k = row.dataset.lvkey, c = S.clips[k];
   if (!c) return;
-  S.panel = null; S.selCue = null; S.selSec = null; S.sel = new Set([k]);
+  S.panel = null; S.selSec = null; S.sel = new Set([k]);
   seek(c.start);
   scroll.scrollLeft = Math.max(0, c.start * S.pps + HEAD - scroll.clientWidth / 3);
   render(); renderInspector();
@@ -2392,7 +2004,6 @@ root.querySelector('.vxe-toolbar').addEventListener('click', (e) => {
   else if (act === 'subs-area') editBlurArea();
   else if (act === 'subs-find') findSubtitles();
   else if (act === 'orig-toggle') toggleOriginal();
-  else if (act === 'captions') toggleSubs();
   else if (act === 'level') {
     S.mix.level = !levelOn();
     showLevelButton();
@@ -2438,7 +2049,6 @@ document.addEventListener('keydown', (e) => {
   else if (mod && key === 'y') redo();
   else if (mod && key === 'a') { S.sel = new Set(keys()); renderSelection(); }
   else if (mod) handled = false;
-  else if (e.altKey && (key === 'ArrowUp' || key === 'ArrowDown') && S.selCue) moveCueRow(S.selCue, key === 'ArrowUp' ? -1 : 1);
   else if (e.altKey && (key === 'ArrowUp' || key === 'ArrowDown') && sel.length) moveRows(sel, key === 'ArrowUp' ? -1 : 1);
   else if ((key === 'ArrowLeft' || key === 'ArrowRight') && sel.length) nudge(sel, (key === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 0.5 : 0.05));
   else if (key === 'ArrowLeft' || key === 'ArrowRight') seek(now() + (key === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 5 : 1));
@@ -2451,10 +2061,8 @@ document.addEventListener('keydown', (e) => {
   else if (key === 'j') joinPieces(selKeys());
   else if ((key === 'm' || key === 'Delete' || key === 'Backspace') && S.selSec != null) muteSection(S.selSec);
   else if ((key === '[' || key === ']') && sel.length) stepSpeed(sel, key === '[' ? -0.05 : 0.05);
-  else if ((key === 'Delete' || key === 'Backspace') && S.selCue) deleteCue(S.selCue);
   else if ((key === 'Delete' || key === 'Backspace') && S.selBlur) deleteBlur(S.selBlur);
   else if ((key === 'Delete' || key === 'Backspace') && sel.length) deletePieces(sel);
-  else if (key === 'n' && S.data && S.data.video) addCue(now());
   else if (key === 'm' && sel.length) toggleMute(sel);
   else if (key === 's' && sel.length) alignClips(selLines());
   else if (key === 'r' && S.sel.size) regenerate(selLines());
@@ -2463,7 +2071,7 @@ document.addEventListener('keydown', (e) => {
   else if (key === 'Escape' && root.classList.contains('vxe-max')) toggleFullscreen();
   else if (key === 'Home') seek(0);
   else if (key === 'End') seek(S.dur);
-  else if (key === 'Escape') { S.sel.clear(); S.selCue = null; S.selSec = null; S.selBlur = null; renderSelection(); }
+  else if (key === 'Escape') { S.sel.clear(); S.selSec = null; S.selBlur = null; renderSelection(); }
   else handled = false;
   if (handled) e.preventDefault();
 });

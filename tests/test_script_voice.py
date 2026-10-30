@@ -173,6 +173,28 @@ def test_a_line_that_drifts_to_the_other_genders_pitch_is_redone(tmp_path):
     assert profiles["Ann"].description.startswith("Adult woman's voice, clearly feminine")
 
 
+def test_a_line_still_failing_after_its_tries_gets_more_rounds_until_it_passes(tmp_path):
+    sr = _StubTTS.sample_rate
+    # voice, then two rounds of one male-ish try each, then a fine one
+    outputs = iter([_tone(210, 1.5, sr), _tone(160, 1.5, sr), _tone(150, 1.5, sr), _tone(205, 1.5, sr)])
+
+    class Model(_StubModel):
+        def generate(self, **kwargs):
+            self.calls.append(kwargs)
+            return next(outputs)
+
+    script = "1\n00:00:00,000 --> 00:00:02,000\n[Ann|female|adult] Hello there\n"
+    lines, profiles = script_voice.read_script(dubbing.parse_srt(script))
+    model = Model()
+    voicer = script_voice.ScriptVoicer(model, tmp_path / "work")
+    opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1, first_line_attempts=1)
+    result = voicer.voice(lines, profiles, str(tmp_path / "script.wav"), opts)
+
+    line_seeds = [c["seed"] for c in model.calls[1:]]
+    assert len(line_seeds) == 3 and len(set(line_seeds)) == 3  # each round with new seeds
+    assert result.report[0]["gender_ok"] and result.report[0]["attempts"] == 3
+    assert not result.warnings or "gender" not in " ".join(result.warnings)
+
 def test_find_srt_problems_reports_blocks_with_a_broken_timing_line(tmp_path):
     srt = tmp_path / "s.srt"
     srt.write_text(
@@ -230,7 +252,8 @@ def test_revoice_speaker_designs_a_new_voice_and_redoes_all_their_lines(tmp_path
     lines, profiles = script_voice.read_script(dubbing.parse_srt(SCRIPT))
     model = _StubModel()
     voicer = script_voice.ScriptVoicer(model, tmp_path / "work")
-    opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1, first_line_attempts=1)
+    opts = dubbing.DubOptions(verify_voice=False, clean_generated=False, max_attempts=1, first_line_attempts=1,
+                              failed_line_rounds=1)
     out = str(tmp_path / "out" / "script.wav")
     voicer.voice(lines, profiles, out, opts)
     old_design = next(c for c in model.calls if c["reference_wav_path"] is None and "Srey" not in c["text"] and "woman" in c["text"])

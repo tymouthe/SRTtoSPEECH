@@ -17,12 +17,6 @@
     display: flex; align-items: center; justify-content: center;
 }
 .vxe-viewer video { width: 100%; height: 100%; object-fit: contain; display: block; }
-.vxe-caption {
-    position: absolute; left: 50%; bottom: 6%; transform: translateX(-50%); max-width: 88%; text-align: center;
-    background: rgba(0, 0, 0, .62); color: #fff; padding: 4px 12px; border-radius: 6px; font-size: 15px; pointer-events: none;
-}
-.vxe-caption:empty { display: none; }
-.vxe-caption b { font-weight: 600; margin-right: 6px; }
 .vxe-drop {
     position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 10px; padding: 20px; text-align: center; background: repeating-linear-gradient(45deg, #1b1e25, #1b1e25 12px, #1e2129 12px, #1e2129 24px);
@@ -170,15 +164,6 @@
 .vxe-subbox-h[data-corner="se"] { right: -6px; bottom: -6px; cursor: nwse-resize; }
 .vxe-btn.vxe-orig-toggle.vxe-off { background: var(--vxe-bad); border-color: var(--vxe-bad); color: #fff; }
 
-/* New subtitles: a track of cues, drawn on the picture (canvas) like the export draws them. */
-.vxe-trackrow.vxe-subs { height: 36px; }
-.vxe-cue {
-    position: absolute; top: 4px; height: 24px; border-radius: 4px; background: #e2c15a; color: #1d1a10; cursor: grab;
-    overflow: hidden; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .35); min-width: 4px;
-}
-.vxe-cue .vxe-clip-label { color: #1d1a10; text-shadow: none; top: 50%; transform: translateY(-50%); }
-.vxe-cue.vxe-selected { box-shadow: 0 0 0 2px #fff, 0 0 10px rgba(255, 255, 255, .35); z-index: 2; }
-.vxe-cue.vxe-empty { background: repeating-linear-gradient(-45deg, #e2c15a, #e2c15a 6px, #cfae4a 6px, #cfae4a 12px); }
 /* The 🌫 Blur track: when (and where) the original subtitles are hidden. */
 .vxe-trackrow.vxe-blurtrack { height: 50px; }
 .vxe-blurpart {
@@ -189,7 +174,6 @@
 .vxe-blurpart .vxe-clip-label { color: #fff; top: 50%; transform: translateY(-50%); }
 .vxe-blurpart.vxe-selected { box-shadow: 0 0 0 2px #fff, 0 0 10px rgba(255, 255, 255, .35); z-index: 2; }
 .vxe-blurpart.vxe-off { opacity: .4; }
-.vxe-subcanvas { position: absolute; display: none; pointer-events: none; z-index: 3; }
 
 /* Parts of the original sound, over its waveform. */
 .vxe-osec { position: absolute; top: 2px; bottom: 2px; border-left: 1px solid rgba(255, 255, 255, .25); cursor: pointer; }

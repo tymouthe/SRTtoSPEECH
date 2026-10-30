@@ -2,11 +2,11 @@ import os
 import re
 import sys
 import json
+import html
 import time
 import tempfile
 import threading
 import logging
-import random
 import numpy as np
 import gradio as gr
 from typing import Optional, Tuple
@@ -27,134 +27,30 @@ logger = logging.getLogger(__name__)
 
 # ---------- Inline i18n (en + zh-CN only) ----------
 
-_USAGE_INSTRUCTIONS_EN = (
-    "**VoxCPM2 — Three Modes of Speech Generation:**\n\n"
-    "🎨 **Voice Design** — Create a brand-new voice  \n"
-    "No reference audio required. Describe the desired voice characteristics "
-    "(gender, age, tone, emotion, pace …) in **Control Instruction**, and VoxCPM2 "
-    "will craft a unique voice from your description alone.\n\n"
-    "🎛️ **Controllable Cloning** — Clone a voice with optional style guidance  \n"
-    "Upload a reference audio clip, then use **Control Instruction** to steer "
-    "emotion, speaking pace, and overall style while preserving the original timbre.\n\n"
-    "🎙️ **Ultimate Cloning** — Reproduce every vocal nuance through audio continuation  \n"
-    "Turn on **Ultimate Cloning Mode** and provide (or auto-transcribe) the reference audio's transcript. "
-    "The model treats the reference clip as a spoken prefix and seamlessly **continues** from it, faithfully preserving every vocal detail."
-    "Note: This mode will disable Control Instruction."
-)
-
-_EXAMPLES_FOOTER_EN = (
-    "---\n"
-    "**💡 Voice Description Examples:**  \n"
-    "Try the following Control Instructions to explore different voices:  \n\n"
-    "**Example 1 — Gentle & Melancholic Girl**  \n"
-    '`Control Instruction`: *"A young girl with a soft, sweet voice. '
-    'Speaks slowly with a melancholic, slightly tsundere tone."*  \n'
-    "`Target Text`: *\"I never asked you to stay… It's not like I care or anything. "
-    "But… why does it still hurt so much now that you're gone?\"*  \n\n"
-    "**Example 2 — Laid-Back Surfer Dude**  \n"
-    '`Control Instruction`: *"Relaxed young male voice, slightly nasal, '
-    'lazy drawl, very casual and chill."*  \n'
-    '`Target Text`: *"Dude, did you see that set? The waves out there are totally gnarly today. '
-    "Just catching barrels all morning — it's like, totally righteous, you know what I mean?\"*"
-)
-
-_USAGE_INSTRUCTIONS_ZH = (
-    "**VoxCPM2 — 三种语音生成方式：**\n\n"
-    "🎨 **声音设计（Voice Design）**  \n"
-    "无需参考音频。在 **Control Instruction** 中描述目标音色特征"
-    "（性别、年龄、语气、情绪、语速等），VoxCPM2 即可为你从零创造独一无二的声音。\n\n"
-    "🎛️ **可控克隆（Controllable Cloning）**  \n"
-    "上传参考音频，同时可选地使用 **Control Instruction** 来指定情绪、语速、风格等表达方式，"
-    "在保留原始音色的基础上灵活控制说话风格。\n\n"
-    "🎙️ **极致克隆（Ultimate Cloning）**  \n"
-    "开启 **极致克隆模式** 并提供参考音频的文字内容（可自动识别）。"
-    "模型会将参考音频视为已说出的前文，以**音频续写**的方式完整还原参考音频中的所有声音细节。"
-    "注意：该模式与可控克隆模式互斥，将禁用Control Instruction。\n\n"
-)
-
-_EXAMPLES_FOOTER_ZH = (
-    "---\n"
-    "**💡 声音描述示例（中英文均可）：**  \n\n"
-    "**示例 1 — 深宫太后**  \n"
-    '`Control Instruction`: *"中老年女性，声音低沉阴冷，语速缓慢而有力，'
-    '字字深思熟虑，带有深不可测的城府与威慑感。"*  \n'
-    '`Target Text`: *"哀家在这深宫待了四十年，什么风浪没见过？你以为瞒得过哀家？"*  \n\n'
-    "**示例 2 — 暴躁驾校教练**  \n"
-    '`Control Instruction`: *"暴躁的中年男声，语速快，充满无奈和愤怒"*  \n'
-    '`Target Text`: *"踩离合！踩刹车啊！你往哪儿开呢？前面是树你看不见吗？'
-    '我教了你八百遍了，打死方向盘！你是不是想把车给我开到沟里去？"*  \n\n'
-    "---\n"
-    "**🗣️ 方言生成指南：**  \n"
-    "要生成地道的方言语音，请在 **Target Text** 中直接使用方言词汇和句式，"
-    "并在 **Control Instruction** 中描述方言特征。  \n\n"
-    "**示例 — 广东话**  \n"
-    '`Control Instruction`: *"粤语，中年男性，语气平淡"*  \n'
-    '✅ 正确（粤语表达）：*"伙計，唔該一個A餐，凍奶茶少甜！"*  \n'
-    '❌ 错误（普通话原文）：*"伙计，麻烦来一个A餐，冻奶茶少甜！"*  \n\n'
-    "**示例 — 河南话**  \n"
-    '`Control Instruction`: *"河南话，接地气的大叔"*  \n'
-    '✅ 正确（河南话表达）：*"恁这是弄啥嘞？晌午吃啥饭？"*  \n'
-    '❌ 错误（普通话原文）：*"你这是在干什么呢？中午吃什么饭？"*  \n\n'
-    "🤖 **小技巧：** 不知道方言怎么写？可以用豆包、DeepSeek、Kimi 等 AI 助手"
-    "将普通话翻译为方言文本，再粘贴到 Target Text 中即可。  \n\n"
-)
-
 _I18N_TRANSLATIONS = {
     "en": {
-        "reference_audio_label": "🎤 Reference Audio (optional — upload for cloning)",
-        "show_prompt_text_label": "🎙️ Ultimate Cloning Mode (transcript-guided cloning)",
-        "show_prompt_text_info": "Auto-transcribes reference audio for every vocal nuance reproduced. Control Instruction will be disabled when active.",
-        "prompt_text_label": "Transcript of Reference Audio (auto-filled via ASR, editable)",
-        "prompt_text_placeholder": "The transcript of your reference audio will appear here …",
-        "control_label": "🎛️ Control Instruction (optional — supports Chinese & English)",
-        "control_placeholder": "e.g. A warm young woman / 年轻女性，温柔甜美 / Excited and fast-paced",
-        "target_text_label": "✍️ Target Text — the content to speak",
-        "generate_btn": "🔊 Generate Speech",
-        "generated_audio_label": "Generated Audio",
-        "advanced_settings_title": "⚙️ Advanced Settings",
-        "ref_denoise_label": "Reference audio enhancement",
-        "ref_denoise_info": "Apply ZipEnhancer denoising to the reference audio before cloning",
-        "normalize_label": "Text normalization",
-        "normalize_info": "Normalize numbers, dates, and abbreviations via wetext",
         "cfg_label": "CFG (guidance scale)",
         "cfg_info": "Higher → closer to the prompt / reference; lower → more creative variation",
         "dit_steps_label": "LocDiT flow-matching steps",
         "dit_steps_info": "LocDiT flow-matching steps — more steps → maybe better audio quality, but slower",
-        "seed_label": "Seed",
-        "seed_info": "Seed used for reproducible generation. Updated with the actual successful seed after generation.",
-        "random_seed_label": "Random Seed",
-        "random_seed_info": "Generate a new seed before each inference run.",
-        "tab_tts": "🗣️ Text to Speech",
-        "tab_srt": "📝 SRT → Speech",
-        "tab_editor": "🎬 Video Editor",
-        "usage_instructions": _USAGE_INSTRUCTIONS_EN,
-        "examples_footer": _EXAMPLES_FOOTER_EN,
+        "studio_title": "Dubbing Studio",
+        "studio_subtitle": "Turn a tagged SRT into voiced lines, then place them on your video.",
+        "step_script": "Script",
+        "step_voices": "Voices",
+        "step_generate": "Generate",
+        "step_video": "Video",
     },
     "zh-CN": {
-        "reference_audio_label": "🎤 参考音频（可选 — 上传后用于克隆）",
-        "show_prompt_text_label": "🎙️ 极致克隆模式（基于文本引导的极致克隆）",
-        "show_prompt_text_info": "自动识别参考音频文本，完整还原音色、节奏、情感等全部声音细节。开启后 Control Instruction 将暂时禁用",
-        "prompt_text_label": "参考音频内容文本（ASR 自动填充，可手动编辑）",
-        "prompt_text_placeholder": "参考音频的文字内容将自动识别并显示在此处 …",
-        "control_label": "🎛️ Control Instruction（可选 — 支持中英文描述）",
-        "control_placeholder": "如：年轻女性，温柔甜美 / A warm young woman / 暴躁老哥，语速飞快",
-        "target_text_label": "✍️ Target Text — 要合成的目标文本",
-        "generate_btn": "🔊 开始生成",
-        "generated_audio_label": "生成结果",
-        "advanced_settings_title": "⚙️ 高级设置",
-        "ref_denoise_label": "参考音频降噪增强",
-        "ref_denoise_info": "克隆前使用 ZipEnhancer 对参考音频进行降噪处理",
-        "normalize_label": "文本规范化",
-        "normalize_info": "自动规范化数字、日期及缩写（基于 wetext）",
         "cfg_label": "CFG（引导强度）",
         "cfg_info": "数值越高 → 越贴合提示/参考音色；数值越低 → 生成风格更自由",
         "dit_steps_label": "LocDiT 流匹配迭代步数",
         "dit_steps_info": "LocDiT 流匹配生成迭代步数 — 步数越多 → 可能生成更好的音频质量，但速度变慢",
-        "tab_tts": "🗣️ 语音合成",
-        "tab_srt": "📝 字幕配音",
-        "tab_editor": "🎬 视频编辑",
-        "usage_instructions": _USAGE_INSTRUCTIONS_ZH,
-        "examples_footer": _EXAMPLES_FOOTER_ZH,
+        "studio_title": "配音工作室",
+        "studio_subtitle": "把标注好的字幕变成配音，再放到你的视频上。",
+        "step_script": "字幕",
+        "step_voices": "音色",
+        "step_generate": "生成",
+        "step_video": "视频",
     },
     "zh-Hans": None,  # alias, filled below
     "zh": None,  # alias, filled below
@@ -169,13 +65,59 @@ for _d in _I18N_TRANSLATIONS.values():
 
 I18N = gr.I18n(**_I18N_TRANSLATIONS)
 
-DEFAULT_TARGET_TEXT = (
-    "VoxCPM2 is a creative multilingual TTS model from ModelBest, " "designed to generate highly realistic speech."
-)
 
 _CUSTOM_CSS = """
 /* No Gradio footer ("Use via API · Built with Gradio · Settings"). */
 footer { display: none !important; }
+
+/* Dubbing Studio: the page header. */
+.studio-head { display: flex; align-items: center; gap: 14px; padding: 6px 4px 2px; }
+.studio-logo { width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center; font-size: 22px;
+  background: var(--color-accent-soft); flex-shrink: 0; }
+.studio-title { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.01em; line-height: 1.2; }
+.studio-subtitle { color: var(--body-text-color-subdued); }
+
+/* The steps (Script → Voices → Generate → Video): numbered tabs joined by a line. */
+#studio-steps > .tab-wrapper { height: auto; padding: 4px 0 12px; }
+#studio-steps > .tab-wrapper .tab-container { height: auto; counter-reset: step; gap: 8px; overflow: visible; }
+#studio-steps > .tab-wrapper .tab-container::after { display: none; }
+#studio-steps > .tab-wrapper .tab-container > button[role="tab"] {
+  counter-increment: step; flex: 1 1 0; max-width: none; height: auto; padding: 10px 14px; border-radius: 12px;
+  display: flex; align-items: center; gap: 10px; font-size: var(--text-md); font-weight: 600;
+  border: 1px solid var(--border-color-primary); background: var(--block-background-fill);
+  color: var(--body-text-color-subdued); transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+#studio-steps > .tab-wrapper .tab-container > button[role="tab"]::before {
+  content: counter(step); width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center;
+  flex-shrink: 0; font-size: var(--text-sm); background: var(--background-fill-secondary);
+  color: var(--body-text-color-subdued); transition: background 0.15s, color 0.15s;
+}
+#studio-steps > .tab-wrapper .tab-container > button[role="tab"]:hover { border-color: var(--color-accent); color: var(--body-text-color); }
+#studio-steps > .tab-wrapper .tab-container > button[role="tab"].selected {
+  border-color: var(--color-accent); background: var(--color-accent-soft); color: var(--body-text-color);
+}
+#studio-steps > .tab-wrapper .tab-container > button[role="tab"].selected::before { background: var(--color-accent); color: #fff; }
+#studio-steps > .tab-wrapper .tab-container > button[role="tab"].selected::after { display: none; }
+
+/* Inside a step: its heading, card panels and the back / next row. */
+.studio-intro { margin: 2px 0 6px; color: var(--body-text-color-subdued); }
+.studio-intro-title { font-size: 1.15rem; font-weight: 700; color: var(--body-text-color); margin-bottom: 2px; }
+.studio-intro code { font-size: 0.9em; }
+.studio-card { padding: 12px !important; border: 1px solid var(--border-color-primary); border-radius: 12px;
+  background: var(--background-fill-secondary); }
+.studio-nav { justify-content: space-between; align-items: center; margin-top: 4px; }
+
+/* SRT → Speech: the progress card shown while lines are generated. */
+.srt-progress { padding: 14px 16px; border: 1px solid var(--border-color-primary); border-radius: 10px;
+  background: var(--background-fill-secondary); }
+.srt-progress-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px;
+  font-weight: 600; }
+.srt-progress-head b { font-variant-numeric: tabular-nums; }
+.srt-progress-track { height: 8px; border-radius: 999px; background: var(--border-color-primary); overflow: hidden; }
+.srt-progress-fill { height: 100%; border-radius: 999px; background: var(--color-accent);
+  transition: width 0.9s linear; }
+.srt-progress-desc { margin-top: 8px; font-variant-numeric: tabular-nums; }
+.srt-progress-hint { margin-top: 4px; font-size: var(--text-sm); color: var(--body-text-color-subdued); }
 
 /* Toggle switch style */
 .switch-toggle {
@@ -239,18 +181,30 @@ class VoxCPMDemo:
 
         self.voxcpm_model: Optional[voxcpm.VoxCPM] = None
         self._model_id = model_id
+        self._load_lock = threading.Lock()
 
     def get_or_load_voxcpm(self) -> voxcpm.VoxCPM:
-        if self.voxcpm_model is not None:
+        with self._load_lock:  # loaded once, even when the startup warm-up and a first request overlap
+            if self.voxcpm_model is not None:
+                return self.voxcpm_model
+            logger.info(f"Loading model: {self._model_id}")
+            self.voxcpm_model = voxcpm.VoxCPM.from_pretrained(
+                self._model_id,
+                optimize=self.optimize,
+                device=self.device,
+            )
+            logger.info("Model loaded successfully.")
             return self.voxcpm_model
-        logger.info(f"Loading model: {self._model_id}")
-        self.voxcpm_model = voxcpm.VoxCPM.from_pretrained(
-            self._model_id,
-            optimize=self.optimize,
-            device=self.device,
-        )
-        logger.info("Model loaded successfully.")
-        return self.voxcpm_model
+
+    def warm_up(self) -> None:
+        """Load VoxCPM in the background at startup, so the first generation does not wait for it."""
+        def _load():
+            try:
+                self.get_or_load_voxcpm()
+            except Exception:
+                logger.exception("Loading VoxCPM at startup failed; it is loaded on first use instead")
+
+        threading.Thread(target=_load, daemon=True).start()
 
     def get_or_load_asr_model(self) -> AutoModel:
         if self.asr_model is not None:
@@ -391,9 +345,16 @@ _SRT_INSTRUCTIONS = (
     "5. A speaker's voice doesn't fit them? Choose them under **🎭 New voice for a speaker** (edit their gender, age or "
     "description in the Speakers table first if you like) — their voice is designed again and all of their lines are "
     "regenerated.\n\n"
-    "💾 Your project is saved as you go: if you close or reload this tab, reopening the page brings back your tables and "
+    "💾 Your project is saved as you go: if you close or reload the page, reopening the page brings back your tables and "
     "every line already generated, and a generation in progress keeps running in the background."
 )
+
+
+def _step_intro(title: str, text: str) -> str:
+    """The heading of a step of the studio: what it is for, in one line."""
+    return f'<div class="studio-intro"><div class="studio-intro-title">{title}</div><div>{text}</div></div>'
+
+
 # Voice: a voice template from the library, or "auto" (designed from the speaker's first line). It is last, so
 # projects saved before it still load.
 _SRT_SPEAKER_HEADERS = ["Speaker", "Gender", "Age", "Voice description", "Lines", "Voice"]
@@ -499,7 +460,7 @@ def _template_choices() -> list:
     ]
 
 
-def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
+def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks, steps: gr.Tabs) -> dict:
     """The SRT → Speech tab. Returns what the video editor tab needs: ``start_job(workdir, speaker_rows,
     line_rows, options, only, new_voices)`` to regenerate lines, and the hand-over between the two tabs."""
     import shutil
@@ -538,7 +499,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
                     f"🎬 Tone read from the video for **{used} of {len(lines)} lines**"
                     + (f" ({len(lines) - used} had no speech in the video at their time)" if used < len(lines) else "")
                     + ("; detected emotions are marked *(from video)*" if video_emotion else "")
-                    + ". The video is also ready in the 🎬 Video Editor tab."
+                    + ". The video is also ready on the ④ Video step."
                     + (f"\n\n🎵 **{music} line(s) have music under the speech**, which the emotion model hears as anger, "
                        "so their emotion was not taken from the video (they keep the guess). Tick **Separate the voices "
                        "from the music first** and Analyze again to read those too." if music else "")
@@ -725,17 +686,20 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
             gr.update(visible=True),
         )
 
-    def _partial_outputs(workdir, line_rows, notes, tagged=None):
-        """What the page shows for a run that is still going or stopped part-way: the lines made so far."""
+    def _partial_outputs(workdir, line_rows, notes, tagged=None, keep_pick=False):
+        """What the page shows for a run that is still going or stopped part-way: the lines made so far.
+        ``keep_pick``: leave the line being listened to selected (new lines are only added to the list)."""
         lines_dir = Path(workdir, "script_lines")
         line_files = sorted(str(p) for p in lines_dir.glob("*.wav")) if lines_dir.exists() else []
         done = script_voice.generated_lines(workdir)
+        choices = [(Path(f).stem, f) for f in line_files]
+        first = line_files[0] if line_files else None
         return (
             no_change,
             no_change,
             line_files,
-            gr.update(choices=[(Path(f).stem, f) for f in line_files], value=line_files[0] if line_files else None),
-            line_files[0] if line_files else None,
+            gr.update(choices=choices) if keep_pick else gr.update(choices=choices, value=first),
+            no_change if keep_pick else first,
             tagged if tagged else no_change,
             no_change,
             notes,
@@ -759,8 +723,20 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
                     else "Regenerating" if only else "Line")
 
             def _on_progress(i, n, line):
-                job["i"], job["n"] = i, n
-                job["desc"] = f"{verb} {min(i + 1, n)}/{n} — #{line.index} {line.speaker}"
+                now = time.monotonic()
+                if i > job["i"] and job["line_t0"]:
+                    job["line_times"].append((now - job["line_t0"]) / (i - job["i"]))
+                job["i"], job["n"], job["line_t0"], job["try"] = i, n, now, (0, 0)
+                job["line"] = f"{verb} {min(i + 1, n)}/{n} — #{line.index} {line.speaker}"
+                job["desc"] = job["line"]
+
+            def _on_try(attempt, tries):
+                job["try"] = (attempt, tries)
+
+            def _on_stage(text):
+                job["desc"], job["line_t0"] = text, 0.0
+
+            voicer.on_try, voicer.on_stage = _on_try, _on_stage
 
             out = os.path.join(workdir, "script.wav")
             job["result"] = voicer.voice(
@@ -771,10 +747,37 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
             logger.exception("SRT voicing failed")
             job["error"], job["status"] = str(e), "failed"
 
+    def _duration(seconds: float) -> str:
+        seconds = int(round(seconds))
+        return f"{seconds // 60} min {seconds % 60:02d} s" if seconds >= 60 else f"{max(seconds, 1)} s"
+
+    def _job_status(job) -> tuple[float, str]:
+        """How far a run is (0–1, moving smoothly within a line from how long lines take) and what it is doing."""
+        i, n = job["i"], max(job["n"], 1)
+        times = job["line_times"][-8:]
+        per_line = sum(times) / len(times) if times else None
+        within, desc = 0.0, job["desc"] or "Starting..."
+        if job["line_t0"] and job["desc"] == job["line"]:
+            elapsed = time.monotonic() - job["line_t0"]
+            within = min(elapsed / (per_line or 15.0), 0.95)
+            attempt, tries = job["try"]
+            if attempt > 1:
+                desc += f" · try {attempt}/{tries}"
+            if per_line:
+                left = max(per_line * (n - i) - elapsed, 0)
+                desc += f" · about {_duration(left)} left"
+        return min((i + within) / n, 1.0), desc
+
     def _job_note(job) -> str:
+        fraction, desc = _job_status(job)
         return (
-            f"⏳ **Generating in the background — {job['desc'] or 'starting...'}**\n\n"
-            "It keeps going even if you close this tab; reopen the page to see the results."
+            '<div class="srt-progress">'
+            f'<div class="srt-progress-head"><span>⏳ Generating</span><b>{fraction:.0%}</b></div>'
+            f'<div class="srt-progress-track"><div class="srt-progress-fill" style="width: {fraction * 100:.1f}%"></div></div>'
+            f'<div class="srt-progress-desc">{html.escape(desc)}</div>'
+            '<div class="srt-progress-hint">Lines appear below as they are made. It keeps going even if you close this '
+            'tab; reopen the page to see the results.</div>'
+            "</div>"
         )
 
     def _run(
@@ -788,11 +791,21 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
             [verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence, max_pause, cfg_value, dit_steps],
             only, new_voices, speaker,
         )
-        # Follow the job; if the tab is closed it simply carries on in the background.
+        # Follow the job, showing each line as soon as it is made; if the tab is closed it simply carries on in
+        # the background.
+        shown, ticks = 0, 0
         while job["status"] == "running":
-            progress(job["i"] / max(job["n"], 1), desc=job["desc"] or "Starting...")
-            time.sleep(0.5)
-        return _finished(job, workdir, line_rows)
+            fraction, desc = _job_status(job)
+            progress(fraction, desc=desc)
+            if job["i"] > shown:
+                # Keep the line being listened to; only the first lines made pick one.
+                yield _partial_outputs(workdir, line_rows, _job_note(job), keep_pick=bool(shown))
+                shown = job["i"]
+            elif ticks % 4 == 0:
+                yield (no_change,) * 7 + (_job_note(job),) + (no_change,) * 5  # the status line, once a second
+            ticks += 1
+            time.sleep(0.25)
+        yield _finished(job, workdir, line_rows)
 
     def _start_job(workdir, speaker_rows, line_rows, settings, only=None, new_voices=(), speaker=None):
         """Start a generation in the background (raises gr.Error if the tables are wrong or a run is going).
@@ -826,7 +839,8 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
         with _SRT_JOBS_LOCK:
             if any(j["status"] == "running" for j in _SRT_JOBS.values()):
                 raise gr.Error("A generation is already running — wait for it to finish (its progress is shown here).")
-            job = {"status": "running", "i": 0, "n": len(lines), "desc": "", "error": None, "result": None,
+            job = {"status": "running", "i": 0, "n": len(lines), "desc": "", "line": "", "line_t0": 0.0,
+                   "line_times": [], "try": (0, 0), "error": None, "result": None,
                    "only": only, "new_voices": set(new_voices), "speaker": speaker}
             _SRT_JOBS[workdir] = job
         _srt_save_tables(workdir, speaker_rows, line_rows, options=list(settings))
@@ -869,7 +883,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
         done = script_voice.generated_lines(workdir) if workdir else set()
         total = {int(float(r[0])) for r in _table_rows(line_rows) if str(r[5]).strip()}
         only = set() if done and total - done else None
-        return _run(
+        yield from _run(
             workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
             max_pause, cfg_value, dit_steps, progress, only=only,
         )
@@ -880,7 +894,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
     ):
         if not speaker:
             raise gr.Error("Choose the speaker whose lines to make first.")
-        return _run(
+        yield from _run(
             workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
             max_pause, cfg_value, dit_steps, progress, speaker=speaker,
         )
@@ -891,7 +905,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
     ):
         if not selected:
             raise gr.Error("Choose the line(s) to regenerate first (failed ⚠ and unfinished ⏳ lines are pre-selected).")
-        return _run(
+        yield from _run(
             workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
             max_pause, cfg_value, dit_steps, progress, only={int(v) for v in selected},
         )
@@ -902,7 +916,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
     ):
         if not speaker:
             raise gr.Error("Choose the speaker who needs a new voice first (speakers are listed after Generate).")
-        return _run(
+        yield from _run(
             workdir, speaker_rows, line_rows, verify_voice, max_tries, max_speedup, pad_to_slot, remove_silence,
             max_pause, cfg_value, dit_steps, progress, only=(), new_voices={speaker},
         )
@@ -936,193 +950,224 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
         )
         return head + _partial_outputs(workdir, line_rows, note, tagged) + (gr.Timer(active=False),)
 
-    def _poll(workdir, line_rows):
-        """While a background run goes on, update its progress; when it ends, show its results once."""
+    def _poll(workdir, line_rows, picked=None, shown=-1):
+        """While a background run goes on, update its progress; when it ends, show its results once.
+        ``shown``: how many lines the page lists - the lists are only sent again when a new line is made, the
+        rest of the time just the progress (sending them every second makes them flicker)."""
         job = _SRT_JOBS.get(workdir) if workdir else None
         if not job:
-            return (no_change,) * 13 + (gr.Timer(active=False),)
+            return (no_change,) * 13 + (gr.Timer(active=False), -1)
         if job["status"] == "running":
-            return _partial_outputs(workdir, line_rows, _job_note(job)) + (gr.Timer(active=True),)
+            if job["i"] == shown:
+                return (no_change,) * 7 + (_job_note(job),) + (no_change,) * 5 + (gr.Timer(active=True), shown)
+            return _partial_outputs(workdir, line_rows, _job_note(job), keep_pick=bool(picked)) + (
+                gr.Timer(active=True), job["i"],
+            )
         if job["status"] == "failed":
             return (no_change,) * 7 + (f"⚠️ The run stopped with an error: {job['error']}",) + (no_change,) * 5 + (
-                gr.Timer(active=False),
+                gr.Timer(active=False), -1,
             )
-        return _finished(job, workdir, line_rows) + (gr.Timer(active=False),)
+        return _finished(job, workdir, line_rows) + (gr.Timer(active=False), -1)
 
-    gr.Markdown(_SRT_INSTRUCTIONS)
     workdir_state = gr.State(None)
     voices_state = gr.State({})
-    poll_timer = gr.Timer(2.0, active=False)
-    with gr.Row():
-        with gr.Column():
-            srt_input = gr.File(label="📝 Tagged subtitles (.srt)", file_types=[".srt"], type="filepath")
-            video_input = gr.File(
-                label="🎬 Original video (optional) — each line's emotion and tone are read from its speech",
-                file_types=["video", "audio", ".mkv", ".avi", ".mov", ".mp4", ".webm", ".wav", ".mp3", ".m4a"],
-                type="filepath",
-            )
-            video_emotion_input = gr.Checkbox(
-                value=False,
-                label="Also take each line's emotion from the video (rough)",
-                info="Off: only the tone (louder, softer, faster, …) is read. On: lines with no emotion in their tag also get "
-                "one from the video — a rough guess (any tense, raised voice is heard as angry)",
-                elem_classes=["switch-toggle"],
-            )
-            auto_voices_input = gr.Checkbox(
-                value=True,
-                label="🪄 Give each speaker the voice template that fits them best",
-                info="From their gender, age and description (and their voice in the original video, if added); "
-                "off: a new voice is designed from each speaker's first line",
-                elem_classes=["switch-toggle"],
-            )
-            isolate_input = gr.Checkbox(
-                value=False,
-                label="Separate the voices from the music first",
-                info="Slower (a few minutes, and a one-time download), much more accurate when there is music under the speech",
-                elem_classes=["switch-toggle"],
-            )
-            guess_emotion = gr.Checkbox(
-                value=True,
-                label="Guess missing emotions",
-                info="From punctuation (?!, !, …) and English keywords; marked (guessed) so you can check them",
-                elem_classes=["switch-toggle"],
-            )
-            analyze_btn = gr.Button("1️⃣ Analyze script", variant="secondary")
-            tagged_output = gr.File(label="Tagged SRT (every line with speaker, gender, age and emotion)")
-        with gr.Column():
-            audio_output = gr.Audio(label="Combined track (on the SRT timing)", type="filepath")
-            editor_btn = gr.Button(
-                "🎬 Next: place the vocals on your video (Video Editor) →", variant="primary", visible=False
-            )
+    poll_timer = gr.Timer(1.0, active=False)
+    poll_shown = gr.State(-1)  # lines listed by the page while it follows a run in the background
 
-    with gr.Row():
-        with gr.Column():
-            zip_output = gr.DownloadButton("⬇️ Download all lines (.zip)", variant="primary", interactive=False)
-            line_files_output = gr.File(
-                label="⬇️ Every line as its own file — click a file to download just that one", file_count="multiple"
-            )
-        with gr.Column():
-            line_picker = gr.Dropdown(choices=[], label="🎧 Listen to a line", interactive=True)
-            line_player = gr.Audio(label="Selected line", type="filepath")
+    # ----- ① Script: the SRT (and optionally the video), analyzed into speakers and lines -----
+    with gr.Tab(I18N("step_script"), id="script") as script_step:
+        gr.HTML(_step_intro("Load your script", "Upload a tagged SRT — <code>[Name|male|adult|sad] text</code> — and, "
+                            "if you have it, the original video. Analyze, then check the lines below."))
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=3, elem_classes=["studio-card"]):
+                srt_input = gr.File(label="📝 Tagged subtitles (.srt)", file_types=[".srt"], type="filepath")
+                video_input = gr.File(
+                    label="🎬 Original video (optional) — each line's emotion and tone are read from its speech",
+                    file_types=["video", "audio", ".mkv", ".avi", ".mov", ".mp4", ".webm", ".wav", ".mp3", ".m4a"],
+                    type="filepath",
+                )
+            with gr.Column(scale=2, elem_classes=["studio-card"]):
+                video_emotion_input = gr.Checkbox(
+                    value=False,
+                    label="Also take each line's emotion from the video (rough)",
+                    info="Off: only the tone (louder, softer, faster, …) is read. On: lines with no emotion in their tag also get "
+                    "one from the video — a rough guess (any tense, raised voice is heard as angry)",
+                    elem_classes=["switch-toggle"],
+                )
+                auto_voices_input = gr.Checkbox(
+                    value=True,
+                    label="🪄 Give each speaker the voice template that fits them best",
+                    info="From their gender, age and description (and their voice in the original video, if added); "
+                    "off: a new voice is designed from each speaker's first line",
+                    elem_classes=["switch-toggle"],
+                )
+                isolate_input = gr.Checkbox(
+                    value=False,
+                    label="Separate the voices from the music first",
+                    info="Slower (a few minutes, and a one-time download), much more accurate when there is music under the speech",
+                    elem_classes=["switch-toggle"],
+                )
+                guess_emotion = gr.Checkbox(
+                    value=True,
+                    label="Guess missing emotions",
+                    info="From punctuation (?!, !, …) and English keywords; marked (guessed) so you can check them",
+                    elem_classes=["switch-toggle"],
+                )
+        with gr.Row():
+            analyze_btn = gr.Button("🔍 Analyze script", variant="primary", size="lg", scale=3)
+            script_next = gr.Button("Next: Voices →", variant="secondary", size="lg", scale=1)
+        script_notes = gr.Markdown()
+        lines_table = gr.Dataframe(
+            headers=_SRT_LINE_HEADERS,
+            datatype=["number", "number", "number", "str", "str", "str", "str"],
+            label="💬 Lines — edit speaker, emotion (happy, sad, angry, fearful, surprised, … or any word) or tone "
+            "(how it is said, e.g. louder and more forceful, speaking faster)",
+            interactive=True,
+            wrap=True,
+            max_height=420,
+        )
+        with gr.Row(equal_height=False):
+            tagged_output = gr.File(label="Tagged SRT (every line with speaker, gender, age and emotion)", scale=2)
+            with gr.Accordion("📖 How it works", open=False, elem_classes=["studio-help"]):
+                gr.Markdown(_SRT_INSTRUCTIONS)
 
-    speakers_table = gr.Dataframe(
-        headers=_SRT_SPEAKER_HEADERS,
-        datatype=["str", "str", "str", "str", "number", "str"],
-        label="🎭 Speakers — gender: male / female / unknown, age: adult / kid; the description is the voice prompt; "
-        "Voice: a voice template (choose one below) or auto (designed from their first line)",
-        interactive=True,
-        wrap=True,
-    )
-    with gr.Row():
-        voice_speaker = gr.Dropdown(choices=[], label="🎙 Give a speaker a voice template — speaker", scale=2)
-        voice_template = gr.Dropdown(
-            choices=_template_choices(), value=script_voice.AUTO_VOICE, label="Voice (instead of one designed from their first line)",
-            scale=3,
-        )
-        template_preview = gr.Audio(label="Listen to this voice", type="filepath", scale=3)
-        apply_voice_btn = gr.Button("✅ Use this voice", variant="secondary", scale=1)
-        pick_voices_btn = gr.Button("🪄 Pick the best voices for all speakers", variant="secondary", scale=1)
-    with gr.Accordion("🎙 Manage voice templates (kept for all your projects)", open=False):
-        gr.Markdown(
-            "A voice template is a voice you choose once and use again — for any speaker, in any project — instead of "
-            "a new random voice designed from each speaker's first line. Every line of a speaker with a template copies "
-            "it and adds its own emotion. **Make the starter voices** once (it loads VoxCPM; about 10 s per voice), make "
-            "your own from a description, keep a voice you like from a project, or upload a clip (5–15 s of one person "
-            "speaking clearly)."
-        )
-        starters_btn = gr.Button(
-            "✨ Make the starter voices — Man, Woman, Young man, Young woman, Old man, Old woman, Boy, Girl, Kid, Narrator",
-            variant="primary",
-        )
-        library_table = gr.Dataframe(
-            headers=["Voice", "Gender", "Age", "Description", "Starter"], label="Voice templates", interactive=False, wrap=True,
+    # ----- ② Voices: who speaks, and which voice each of them gets -----
+    with gr.Tab(I18N("step_voices"), id="voices") as voices_step:
+        gr.HTML(_step_intro("Cast the voices", "Check each speaker's gender, age and description, and give them a voice "
+                            "template — or leave <b>auto</b> to design one from their first line."))
+        speakers_table = gr.Dataframe(
+            headers=_SRT_SPEAKER_HEADERS,
+            datatype=["str", "str", "str", "str", "number", "str"],
+            label="🎭 Speakers — gender: male / female / unknown, age: adult / kid; the description is the voice prompt; "
+            "Voice: a voice template (choose one below) or auto (designed from their first line)",
+            interactive=True,
+            wrap=True,
         )
         with gr.Row():
-            new_voice_name = gr.Textbox(label="New voice: name", placeholder="e.g. Grandpa", scale=2)
-            new_voice_gender = gr.Dropdown(["male", "female", "unknown"], value="male", label="Gender", scale=1)
-            new_voice_age = gr.Dropdown(list(script_voice.AGES), value="adult", label="Age", scale=1)
-            new_voice_desc = gr.Textbox(label="Description (the voice prompt)", placeholder="e.g. Old village chief, deep and slow", scale=4)
-            make_voice_btn = gr.Button("🎨 Make this voice", scale=1)
-        with gr.Row():
-            keep_speaker = gr.Dropdown(choices=[], label="Keep a speaker's voice from this project", scale=2)
-            keep_name = gr.Textbox(label="as the template", placeholder="name", scale=2)
-            keep_btn = gr.Button("⭐ Save it as a template", scale=1)
-        with gr.Row():
-            upload_clip = gr.Audio(sources=["upload"], type="filepath", label="Or upload a clip", scale=3)
-            upload_name = gr.Textbox(label="as the template", placeholder="name", scale=2)
-            upload_gender = gr.Dropdown(["male", "female", "unknown"], value="unknown", label="Gender", scale=1)
-            upload_age = gr.Dropdown(list(script_voice.AGES), value="adult", label="Age", scale=1)
-            upload_btn = gr.Button("⬆️ Save the clip", scale=1)
-        with gr.Row():
-            delete_pick = gr.Dropdown(choices=[], label="Delete a voice template", scale=3)
-            delete_btn = gr.Button("🗑 Delete", scale=1)
-        library_notes = gr.Markdown()
-    lines_table = gr.Dataframe(
-        headers=_SRT_LINE_HEADERS,
-        datatype=["number", "number", "number", "str", "str", "str", "str"],
-        label="💬 Lines — edit speaker, emotion (happy, sad, angry, fearful, surprised, … or any word) or tone "
-        "(how it is said, e.g. louder and more forceful, speaking faster)",
-        interactive=True,
-        wrap=True,
-        max_height=420,
-    )
-    with gr.Accordion("⚙️ Settings", open=False):
-        with gr.Row():
-            verify_voice = gr.Checkbox(
-                value=True,
-                label="Check every line matches its speaker's first line",
-                info="CAM++ voice check; regenerates until consistent",
+            voice_speaker = gr.Dropdown(choices=[], label="🎙 Give a speaker a voice template — speaker", scale=2)
+            voice_template = gr.Dropdown(
+                choices=_template_choices(), value=script_voice.AUTO_VOICE, label="Voice (instead of one designed from their first line)",
+                scale=3,
             )
-            max_tries = gr.Slider(1, 20, value=8, step=1, label="Max tries per line", info="Each first line gets at least 12")
-            max_speedup = gr.Slider(
-                1.0, 1.5, value=1.1, step=0.05, label="Max speed-up to fit a line (combined track)",
-                info="Longer lines push the next lines later instead of being squeezed (squeezing changes the voice)",
+            template_preview = gr.Audio(label="Listen to this voice", type="filepath", scale=3)
+            apply_voice_btn = gr.Button("✅ Use this voice", variant="secondary", scale=1)
+            pick_voices_btn = gr.Button("🪄 Pick the best voices for all speakers", variant="secondary", scale=1)
+        with gr.Accordion("🎙 Manage voice templates (kept for all your projects)", open=False):
+            gr.Markdown(
+                "A voice template is a voice you choose once and use again — for any speaker, in any project — instead of "
+                "a new random voice designed from each speaker's first line. Every line of a speaker with a template copies "
+                "it and adds its own emotion. **Make the starter voices** once (it loads VoxCPM; about 10 s per voice), make "
+                "your own from a description, keep a voice you like from a project, or upload a clip (5–15 s of one person "
+                "speaking clearly)."
             )
-            pad_to_slot = gr.Checkbox(
-                value=False,
-                label="Pad short lines with silence",
-                info="Off: every line file keeps its natural length. On: silence after the speech up to the slot length",
+            starters_btn = gr.Button(
+                "✨ Make the starter voices — Man, Woman, Young man, Young woman, Old man, Old woman, Boy, Girl, Kid, Narrator",
+                variant="primary",
             )
+            library_table = gr.Dataframe(
+                headers=["Voice", "Gender", "Age", "Description", "Starter"], label="Voice templates", interactive=False, wrap=True,
+            )
+            with gr.Row():
+                new_voice_name = gr.Textbox(label="New voice: name", placeholder="e.g. Grandpa", scale=2)
+                new_voice_gender = gr.Dropdown(["male", "female", "unknown"], value="male", label="Gender", scale=1)
+                new_voice_age = gr.Dropdown(list(script_voice.AGES), value="adult", label="Age", scale=1)
+                new_voice_desc = gr.Textbox(label="Description (the voice prompt)", placeholder="e.g. Old village chief, deep and slow", scale=4)
+                make_voice_btn = gr.Button("🎨 Make this voice", scale=1)
+            with gr.Row():
+                keep_speaker = gr.Dropdown(choices=[], label="Keep a speaker's voice from this project", scale=2)
+                keep_name = gr.Textbox(label="as the template", placeholder="name", scale=2)
+                keep_btn = gr.Button("⭐ Save it as a template", scale=1)
+            with gr.Row():
+                upload_clip = gr.Audio(sources=["upload"], type="filepath", label="Or upload a clip", scale=3)
+                upload_name = gr.Textbox(label="as the template", placeholder="name", scale=2)
+                upload_gender = gr.Dropdown(["male", "female", "unknown"], value="unknown", label="Gender", scale=1)
+                upload_age = gr.Dropdown(list(script_voice.AGES), value="adult", label="Age", scale=1)
+                upload_btn = gr.Button("⬆️ Save the clip", scale=1)
+            with gr.Row():
+                delete_pick = gr.Dropdown(choices=[], label="Delete a voice template", scale=3)
+                delete_btn = gr.Button("🗑 Delete", scale=1)
+            library_notes = gr.Markdown()
+        voice_notes = gr.Markdown()
+        with gr.Row(elem_classes=["studio-nav"]):
+            voices_back = gr.Button("← Script", variant="secondary", scale=0, min_width=160)
+            voices_next = gr.Button("Next: Generate →", variant="primary", scale=0, min_width=200)
+
+    # ----- ③ Generate: voice every line, listen, fix the ones that need it -----
+    with gr.Tab(I18N("step_generate"), id="generate") as generate_step:
+        gr.HTML(_step_intro("Generate the lines", "Every line is voiced and checked; lines that fail are retried "
+                            "automatically. Listen, fix any line, then place them on your video."))
+        with gr.Accordion("⚙️ Settings", open=False):
+            with gr.Row():
+                verify_voice = gr.Checkbox(
+                    value=True,
+                    label="Check every line matches its speaker's first line",
+                    info="CAM++ voice check; regenerates until consistent",
+                )
+                max_tries = gr.Slider(1, 20, value=8, step=1, label="Max tries per line", info="Each first line gets at least 12")
+                max_speedup = gr.Slider(
+                    1.0, 1.5, value=1.1, step=0.05, label="Max speed-up to fit a line (combined track)",
+                    info="Longer lines push the next lines later instead of being squeezed (squeezing changes the voice)",
+                )
+                pad_to_slot = gr.Checkbox(
+                    value=False,
+                    label="Pad short lines with silence",
+                    info="Off: every line file keeps its natural length. On: silence after the speech up to the slot length",
+                )
+            with gr.Row():
+                remove_silence = gr.Checkbox(
+                    value=True,
+                    label="Remove silences",
+                    info="Cut the silence before and after each line and shorten long pauses inside it",
+                )
+                max_pause = gr.Slider(
+                    0.05, 0.6, value=0.2, step=0.05, label="Longest pause kept inside a line (s)",
+                    info="Pauses longer than this are shortened to it",
+                )
+            with gr.Row():
+                cfg_value = gr.Slider(1.0, 3.0, value=2.0, step=0.1, label=I18N("cfg_label"))
+                dit_steps = gr.Slider(1, 50, value=10, step=1, label=I18N("dit_steps_label"))
         with gr.Row():
-            remove_silence = gr.Checkbox(
-                value=True,
-                label="Remove silences",
-                info="Cut the silence before and after each line and shorten long pauses inside it",
+            generate_btn = gr.Button("▶ Generate all lines", variant="primary", size="lg", scale=2)
+            speaker_gen_picker = gr.Dropdown(
+                choices=[], label="…or one speaker at a time (make their lines, listen, then the next)",
+                scale=4,
             )
-            max_pause = gr.Slider(
-                0.05, 0.6, value=0.2, step=0.05, label="Longest pause kept inside a line (s)",
-                info="Pauses longer than this are shortened to it",
-            )
-        with gr.Row():
-            cfg_value = gr.Slider(1.0, 3.0, value=2.0, step=0.1, label=I18N("cfg_label"))
-            dit_steps = gr.Slider(1, 50, value=10, step=1, label=I18N("dit_steps_label"))
-    generate_btn = gr.Button("2️⃣ Generate all lines", variant="primary", size="lg")
-    with gr.Row():
-        speaker_gen_picker = gr.Dropdown(
-            choices=[], label="…or one speaker at a time — make all of their lines first, listen, then the next speaker",
-            scale=4,
-        )
-        speaker_gen_btn = gr.Button("▶ Generate only this speaker's lines", variant="secondary", scale=1)
-    with gr.Row():
-        retry_picker = gr.Dropdown(
-            choices=[],
-            multiselect=True,
-            label="🔁 Lines to regenerate — failed lines (⚠) are selected after Generate; edit a line's text or "
-            "emotion in the table first if you like",
-            scale=4,
-        )
-        retry_btn = gr.Button("🔁 Regenerate selected lines", variant="secondary", scale=1)
-    with gr.Row():
-        revoice_picker = gr.Dropdown(
-            choices=[],
-            label="🎭 New voice for a speaker — their voice is designed again (from their gender, age and description "
-            "in the Speakers table) and all of their lines are regenerated",
-            scale=2,
-        )
-        voice_preview = gr.Audio(label="This speaker's voice (what all their lines copy)", type="filepath", scale=2)
-        revoice_btn = gr.Button("🎭 New voice — redo all their lines", variant="secondary", scale=1)
-    notes_box = gr.Markdown()
-    report_table = gr.Dataframe(headers=_SRT_REPORT_HEADERS, label="📊 Report", interactive=False, wrap=True)
+            speaker_gen_btn = gr.Button("▶ Generate only this speaker's lines", variant="secondary", scale=1)
+        notes_box = gr.Markdown()
+        with gr.Row(equal_height=False):
+            with gr.Column(elem_classes=["studio-card"]):
+                audio_output = gr.Audio(label="Combined track (on the SRT timing)", type="filepath")
+                line_picker = gr.Dropdown(choices=[], label="🎧 Listen to a line", interactive=True)
+                line_player = gr.Audio(label="Selected line", type="filepath")
+            with gr.Column(elem_classes=["studio-card"]):
+                zip_output = gr.DownloadButton("⬇️ Download all lines (.zip)", variant="primary", interactive=False)
+                line_files_output = gr.File(
+                    label="⬇️ Every line as its own file — click a file to download just that one", file_count="multiple"
+                )
+        with gr.Accordion("🛠 Fix lines and voices", open=True):
+            with gr.Row():
+                retry_picker = gr.Dropdown(
+                    choices=[],
+                    multiselect=True,
+                    label="🔁 Lines to regenerate — failed lines (⚠) are selected after Generate; edit a line's text or "
+                    "emotion on the Script step first if you like",
+                    scale=4,
+                )
+                retry_btn = gr.Button("🔁 Regenerate selected lines", variant="secondary", scale=1)
+            with gr.Row():
+                revoice_picker = gr.Dropdown(
+                    choices=[],
+                    label="🎭 New voice for a speaker — their voice is designed again (from their gender, age and description "
+                    "on the Voices step) and all of their lines are regenerated",
+                    scale=2,
+                )
+                voice_preview = gr.Audio(label="This speaker's voice (what all their lines copy)", type="filepath", scale=2)
+                revoice_btn = gr.Button("🎭 New voice — redo all their lines", variant="secondary", scale=1)
+        with gr.Accordion("📊 Report", open=False):
+            report_table = gr.Dataframe(headers=_SRT_REPORT_HEADERS, show_label=False, interactive=False, wrap=True)
+        with gr.Row(elem_classes=["studio-nav"]):
+            generate_back = gr.Button("← Voices", variant="secondary", scale=0, min_width=160)
+            editor_btn = gr.Button("Next: place on the video →", variant="primary", visible=False, scale=0, min_width=240)
 
     # ----- voice templates -----
     def _library_view():
@@ -1286,9 +1331,10 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
                      "**New voice — redo all their lines** to remake them with the new voice.")
         return rows, note
 
-    pick_voices_btn.click(fn=_pick_all, inputs=[workdir_state, speakers_table, lines_table], outputs=[speakers_table, notes_box])
+    pick_voices_btn.click(fn=_pick_all, inputs=[workdir_state, speakers_table, lines_table],
+                          outputs=[speakers_table, voice_notes])
     apply_voice_btn.click(fn=_apply_voice, inputs=[voice_speaker, voice_template, speakers_table, workdir_state],
-                          outputs=[speakers_table, notes_box])
+                          outputs=[speakers_table, voice_notes])
     starters_btn.click(fn=_make_starters, outputs=library_outputs + [library_notes])
     make_voice_btn.click(fn=_make_one, inputs=[new_voice_name, new_voice_gender, new_voice_age, new_voice_desc],
                          outputs=library_outputs + [library_notes])
@@ -1302,7 +1348,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
     analyze_btn.click(
         fn=_analyze,
         inputs=[srt_input, guess_emotion, video_input, isolate_input, video_emotion_input, auto_voices_input],
-        outputs=[speakers_table, lines_table, tagged_output, workdir_state, notes_box],
+        outputs=[speakers_table, lines_table, tagged_output, workdir_state, script_notes],
     )
     settings = [
         workdir_state, speakers_table, lines_table, verify_voice, max_tries, max_speedup, pad_to_slot,
@@ -1312,11 +1358,13 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
         audio_output, zip_output, line_files_output, line_picker, line_player, tagged_output, report_table, notes_box,
         retry_picker, revoice_picker, voices_state, voice_preview, editor_btn,
     ]
-    generate_btn.click(fn=_generate, inputs=settings, outputs=results, api_name="voice_srt")
+    generate_btn.click(fn=_generate, inputs=settings, outputs=results, api_name="voice_srt", show_progress="hidden")
     speaker_gen_btn.click(fn=_generate_speaker, inputs=[speaker_gen_picker] + settings, outputs=results,
-                          api_name="voice_srt_speaker")
-    retry_btn.click(fn=_regenerate, inputs=[retry_picker] + settings, outputs=results, api_name="regenerate_srt_lines")
-    revoice_btn.click(fn=_revoice, inputs=[revoice_picker] + settings, outputs=results, api_name="revoice_srt_speaker")
+                          api_name="voice_srt_speaker", show_progress="hidden")
+    retry_btn.click(fn=_regenerate, inputs=[retry_picker] + settings, outputs=results, api_name="regenerate_srt_lines",
+                    show_progress="hidden")
+    revoice_btn.click(fn=_revoice, inputs=[revoice_picker] + settings, outputs=results, api_name="revoice_srt_speaker",
+                      show_progress="hidden")
     line_picker.change(fn=lambda path: path, inputs=line_picker, outputs=line_player)
     revoice_picker.change(
         fn=lambda name, voices: (voices or {}).get(name), inputs=[revoice_picker, voices_state], outputs=voice_preview
@@ -1337,7 +1385,27 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
 
     restore_outputs = [speakers_table, lines_table, workdir_state] + results + [poll_timer, seen_rev]
     blocks.load(fn=_restore_with_rev, outputs=restore_outputs, api_name="restore_srt")
-    poll_timer.tick(fn=_poll, inputs=[workdir_state, lines_table], outputs=results + [poll_timer])
+
+    def _furthest_step():
+        """A reopened page opens on the step the project has reached: generate once it has lines (or a run)."""
+        workdir = _srt_current_project()
+        if workdir and (_SRT_JOBS.get(workdir) or script_voice.generated_lines(workdir)):
+            return gr.Tabs(selected="generate")
+        return gr.Tabs(selected="voices" if workdir else "script")
+
+    blocks.load(fn=_furthest_step, outputs=steps, show_progress="hidden")
+
+    def _to_voices(workdir):
+        if not workdir:
+            raise gr.Error("Upload an SRT and click Analyze script first.")
+        return gr.Tabs(selected="voices")
+
+    script_next.click(fn=_to_voices, inputs=workdir_state, outputs=steps, show_progress="hidden")
+    voices_back.click(fn=lambda: gr.Tabs(selected="script"), outputs=steps, show_progress="hidden")
+    voices_next.click(fn=lambda: gr.Tabs(selected="generate"), outputs=steps, show_progress="hidden")
+    generate_back.click(fn=lambda: gr.Tabs(selected="voices"), outputs=steps, show_progress="hidden")
+    poll_timer.tick(fn=_poll, inputs=[workdir_state, lines_table, line_picker, poll_shown],
+                    outputs=results + [poll_timer, poll_shown], show_progress="hidden")
 
     def _leave(workdir, speaker_rows, line_rows):
         """Save the tables (with any edits not yet generated) so the video editor sees them."""
@@ -1345,6 +1413,7 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks) -> dict:
             _srt_save_tables(workdir, speaker_rows, line_rows)
 
     return {
+        "steps": [script_step, voices_step, generate_step],
         "editor_btn": editor_btn,
         "leave": _leave,
         "start_job": _start_job,
@@ -1378,7 +1447,7 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
     def _project():
         workdir = _srt_current_project()
         if not workdir:
-            raise ValueError("No SRT → Speech project yet — analyze and generate an SRT first.")
+            raise ValueError("No project yet — analyze and generate an SRT first (steps ① Script to ③ Generate).")
         return workdir
 
     def _tables(workdir):
@@ -1451,7 +1520,6 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
             "clips": state["clips"],
             "mix": state["mix"],
             "tracks": state.get("tracks", {}),
-            "subtitles": state.get("subtitles"),
             "video": video,
             "job": _job(workdir),
         }
@@ -1565,7 +1633,7 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
     def editor_save(arg):
         workdir = _project()
         state = video_editor.load_state(workdir)
-        for key in ("clips", "mix", "tracks", "subtitles"):
+        for key in ("clips", "mix", "tracks"):
             if isinstance(arg.get(key), dict):
                 state[key] = arg[key]
         video_editor.save_state(workdir, state)
@@ -1632,27 +1700,11 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
             return _payload(workdir)
         return {"job": job}
 
-    def _subtitle_images(folder: Path, items: list) -> list:
-        """The subtitle images drawn by the editor (base64 PNG) as files, with when and where to show them."""
-        import base64
-
-        shutil.rmtree(folder, ignore_errors=True)
-        folder.mkdir(parents=True)
-        overlays = []
-        for i, item in enumerate(items):
-            png = base64.b64decode(str(item.get("png") or ""), validate=True)
-            if not png.startswith(b"\x89PNG"):
-                raise ValueError("A subtitle image is not a PNG.")
-            path = folder / f"{i:04d}.png"
-            path.write_bytes(png)
-            overlays.append((float(item["start"]), float(item["end"]), int(item.get("x") or 0), int(item.get("y") or 0), str(path)))
-        return overlays
-
     @_safe
     def editor_export(arg):
         workdir = _project()
         state = video_editor.load_state(workdir)
-        for key in ("clips", "mix", "tracks", "subtitles"):
+        for key in ("clips", "mix", "tracks"):
             if isinstance(arg.get(key), dict):
                 state[key] = arg[key]
         video_editor.save_state(workdir, state)
@@ -1725,7 +1777,6 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
             video_path = out_dir / f"{stem}_dubbed{video_editor.export_extension(info['source'])}"
             video_editor.export_video(
                 info["source"], str(mix_path), video_path, subtitles=mix.get("subs"),
-                overlays=_subtitle_images(out_dir / "subtitles", arg.get("overlays") or []),
             )
             result = {"video_url": _file_url(str(video_path), version), "video_name": video_path.name}
         # An audio file (no picture) exports as the soundtrack only.
@@ -1766,209 +1817,24 @@ def build_editor_tab(tabs: gr.Tabs, editor_tab: gr.Tab, srt: dict) -> None:
 def create_demo_interface(demo: VoxCPMDemo):
     gr.set_static_paths(paths=[Path.cwd().absolute() / "assets"])
 
-    def _coerce_seed(seed_value) -> Optional[int]:
-        if seed_value is None or seed_value == "":
-            return None
-        return int(seed_value)
-
-    def _prepare_seed(use_random_seed: bool, seed_value):
-        if use_random_seed:
-            return random.randint(0, 2**32 - 1)
-        return _coerce_seed(seed_value)
-
-    def _on_random_seed_toggle(checked):
-        return gr.update(interactive=not checked)
-
-    def _generate(
-        text: str,
-        control_instruction: str,
-        ref_wav: Optional[str],
-        use_prompt_text: bool,
-        prompt_text_value: str,
-        cfg_value: float,
-        do_normalize: bool,
-        denoise: bool,
-        dit_steps: int,
-        seed_value,
-    ):
-        actual_prompt_text = prompt_text_value.strip() if use_prompt_text else ""
-        actual_control = "" if use_prompt_text else control_instruction
-        seed = _coerce_seed(seed_value)
-        sr, wav_np, last_successful_seed = demo.generate_tts_audio(
-            text_input=text,
-            control_instruction=actual_control,
-            reference_wav_path_input=ref_wav,
-            prompt_text=actual_prompt_text,
-            cfg_value_input=cfg_value,
-            do_normalize=do_normalize,
-            denoise=denoise,
-            inference_timesteps=int(dit_steps),
-            seed=seed,
-        )
-        return (sr, wav_np), last_successful_seed
-
-    def _on_toggle_instant(checked):
-        """Instant UI toggle — no ASR, no blocking."""
-        if checked:
-            return (
-                gr.update(visible=True, value="", placeholder="Recognizing reference audio..."),
-                gr.update(visible=False),
-            )
-        return (
-            gr.update(visible=False),
-            gr.update(visible=True, interactive=True),
-        )
-
-    def _run_asr_if_needed(checked, audio_path):
-        """Run ASR after the UI has updated. Only when toggled ON."""
-        if not checked or not audio_path:
-            return gr.update()
-        try:
-            logger.info("Running ASR on reference audio...")
-            asr_text = demo.prompt_wav_recognition(audio_path)
-            logger.info(f"ASR result: {asr_text[:60]}...")
-            return gr.update(value=asr_text)
-        except Exception as e:
-            logger.warning(f"ASR recognition failed: {e}")
-            return gr.update(value="")
-
-    # Full width so every tab (the video editor most of all) uses the whole screen.
+    # Full width so every step (the video editor most of all) uses the whole screen.
     with gr.Blocks(fill_width=True) as interface:
-
-        with gr.Tabs() as tabs:
-            with gr.Tab(I18N("tab_tts"), id="tts"):
-                gr.Markdown(I18N("usage_instructions"))
-
-                with gr.Row():
-                    with gr.Column():
-                        reference_wav = gr.Audio(
-                            sources=["upload", "microphone"],
-                            type="filepath",
-                            label=I18N("reference_audio_label"),
-                        )
-                        show_prompt_text = gr.Checkbox(
-                            value=False,
-                            label=I18N("show_prompt_text_label"),
-                            info=I18N("show_prompt_text_info"),
-                            elem_classes=["switch-toggle"],
-                        )
-                        prompt_text = gr.Textbox(
-                            value="",
-                            label=I18N("prompt_text_label"),
-                            placeholder=I18N("prompt_text_placeholder"),
-                            lines=2,
-                            visible=False,
-                        )
-                        control_instruction = gr.Textbox(
-                            value="",
-                            label=I18N("control_label"),
-                            placeholder=I18N("control_placeholder"),
-                            lines=2,
-                        )
-                        text = gr.Textbox(
-                            value=DEFAULT_TARGET_TEXT,
-                            label=I18N("target_text_label"),
-                            lines=3,
-                        )
-
-                        with gr.Accordion(I18N("advanced_settings_title"), open=False):
-                            DoDenoisePromptAudio = gr.Checkbox(
-                                value=False,
-                                label=I18N("ref_denoise_label"),
-                                elem_classes=["switch-toggle"],
-                                info=I18N("ref_denoise_info"),
-                            )
-                            DoNormalizeText = gr.Checkbox(
-                                value=False,
-                                label=I18N("normalize_label"),
-                                elem_classes=["switch-toggle"],
-                                info=I18N("normalize_info"),
-                            )
-                            cfg_value = gr.Slider(
-                                minimum=1.0,
-                                maximum=3.0,
-                                value=2.0,
-                                step=0.1,
-                                label=I18N("cfg_label"),
-                                info=I18N("cfg_info"),
-                            )
-                            dit_steps = gr.Slider(
-                                minimum=1,
-                                maximum=50,
-                                value=10,
-                                step=1,
-                                label=I18N("dit_steps_label"),
-                                info=I18N("dit_steps_info"),
-                            )
-                            with gr.Row():
-                                seed_value = gr.Number(
-                                    value=random.randint(0, 2**32 - 1),
-                                    precision=0,
-                                    label=I18N("seed_label"),
-                                    info=I18N("seed_info"),
-                                    interactive=False,
-                                )
-                                random_seed = gr.Checkbox(
-                                    value=True,
-                                    label=I18N("random_seed_label"),
-                                    elem_classes=["switch-toggle"],
-                                    info=I18N("random_seed_info"),
-                                )
-
-                        run_btn = gr.Button(I18N("generate_btn"), variant="primary", size="lg")
-
-                    with gr.Column():
-                        audio_output = gr.Audio(label=I18N("generated_audio_label"))
-                        gr.Markdown(I18N("examples_footer"))
-
-                show_prompt_text.change(
-                    fn=_on_toggle_instant,
-                    inputs=[show_prompt_text],
-                    outputs=[prompt_text, control_instruction],
-                ).then(
-                    fn=_run_asr_if_needed,
-                    inputs=[show_prompt_text, reference_wav],
-                    outputs=[prompt_text],
-                )
-
-                random_seed.change(
-                    fn=_on_random_seed_toggle,
-                    inputs=[random_seed],
-                    outputs=[seed_value],
-                )
-
-                run_btn.click(
-                    fn=_prepare_seed,
-                    inputs=[random_seed, seed_value],
-                    outputs=[seed_value],
-                    show_progress=False,
-                ).then(
-                    fn=_generate,
-                    inputs=[
-                        text,
-                        control_instruction,
-                        reference_wav,
-                        show_prompt_text,
-                        prompt_text,
-                        cfg_value,
-                        DoNormalizeText,
-                        DoDenoisePromptAudio,
-                        dit_steps,
-                        seed_value,
-                    ],
-                    outputs=[audio_output, seed_value],
-                    show_progress=True,
-                    api_name="generate",
-                )
-
-            with gr.Tab(I18N("tab_srt"), id="srt") as srt_tab:
-                srt = build_srt_tab(demo, interface)
-            with gr.Tab(I18N("tab_editor"), id="editor") as editor_tab:
-                build_editor_tab(tabs, editor_tab, srt)
-        # Back on the SRT tab after editing in the video editor: show the edited / regenerated lines.
-        srt_tab.select(
-            fn=srt["reopen"], inputs=srt["reopen_inputs"], outputs=srt["reopen_outputs"], show_progress="hidden"
+        gr.HTML(
+            '<div class="studio-head"><div class="studio-logo">🎙</div><div>'
+            f'<div class="studio-title">{_I18N_TRANSLATIONS["en"]["studio_title"]}</div>'
+            f'<div class="studio-subtitle">{_I18N_TRANSLATIONS["en"]["studio_subtitle"]}</div>'
+            "</div></div>"
         )
+        # Script → Voices → Generate → Video, shown as numbered steps (each one can be opened at any time).
+        with gr.Tabs(elem_id="studio-steps") as steps:
+            srt = build_srt_tab(demo, interface, steps)
+            with gr.Tab(I18N("step_video"), id="editor") as editor_step:
+                build_editor_tab(steps, editor_step, srt)
+        # Back on a step of the script after editing in the video editor: show the edited / regenerated lines.
+        for step in srt["steps"]:
+            step.select(
+                fn=srt["reopen"], inputs=srt["reopen_inputs"], outputs=srt["reopen_outputs"], show_progress="hidden"
+            )
 
     return interface
 
@@ -1982,6 +1848,7 @@ def run_demo(
 ):
     demo = VoxCPMDemo(model_id=model_id, device=device)
     interface = create_demo_interface(demo)
+    demo.warm_up()
     interface.queue(max_size=10, default_concurrency_limit=1).launch(
         server_name=server_name,
         server_port=server_port,

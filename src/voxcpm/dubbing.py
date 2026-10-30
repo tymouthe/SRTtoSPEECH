@@ -111,6 +111,10 @@ class DubOptions:
     # tries; a speaker's first line, which all their other lines copy, gets ``first_line_attempts``.
     max_attempts: int = 8
     first_line_attempts: int = 12
+    # SRT → Speech: a line still failing after its tries (not consistent, or not clearly its gender) gets
+    # another round of ``max_attempts`` tries with new seeds, until it passes or ``failed_line_rounds`` rounds
+    # have been made (a cap, so a line that can never pass doesn't stall the run forever).
+    failed_line_rounds: int = 10
     # Lines that clone a speaker's *generated* first line must be at least this close to it, and to the
     # speaker's other accepted lines (cloned speech of the same voice normally scores 0.6-0.85).
     min_consistency: float = 0.55
@@ -1256,6 +1260,11 @@ class VideoDubber:
         self.warnings: list[str] = []
         self.speaker_model = None
         self._embedding_cache: dict[str, Optional[np.ndarray]] = {}
+        self._prompt_cache: dict[tuple, dict] = {}
+        # Called with (try, max tries) as each try of a line starts, e.g. to show progress within a line.
+        self.on_try: Optional[Callable[[int, int], None]] = None
+        # Called with a short description when a step that is not a line starts (designing a voice, mixing, …).
+        self.on_stage: Optional[Callable[[str], None]] = None
 
     @property
     def sample_rate(self) -> int:
@@ -1606,18 +1615,45 @@ class VideoDubber:
             seconds = min(seconds, expected * 3.0 + 1.2)
         return int(np.ceil(rate * seconds))
 
+    def _reference_prompt(self, reference: str) -> Optional[dict]:
+        """The reference voice encoded once (per file version) instead of on every try of every line."""
+        from .core import VoxCPM
+
+        if not isinstance(self.model, VoxCPM):  # another model (or a stand-in) generates its own way
+            return None
+        key = (reference, os.path.getmtime(reference))
+        if key not in self._prompt_cache:
+            self._prompt_cache[key] = self.model.tts_model.build_prompt_cache(reference_wav_path=reference)
+        return self._prompt_cache[key]
+
     def _generate_once(self, text, reference, seed, options: DubOptions, max_len: Optional[int] = None) -> np.ndarray:
         extra = {"max_len": max_len} if max_len else {}
-        wav = self.model.generate(
-            text=text,
-            reference_wav_path=reference,
-            **extra,
-            cfg_value=options.cfg_value,
-            inference_timesteps=options.inference_timesteps,
-            normalize=options.normalize,
-            denoise=False,  # references are denoised once up front (see _prepared_reference)
-            seed=seed,
-        )
+        prompt = self._reference_prompt(reference) if reference and not options.normalize else None
+        if prompt is not None:
+            # What VoxCPM.generate does, minus encoding the same reference clip again on each call.
+            from .model.utils import next_and_close
+
+            wav, _, _ = next_and_close(self.model.tts_model._generate_with_prompt_cache(
+                target_text=re.sub(r"\s+", " ", text.replace("\n", " ")),
+                prompt_cache=prompt,
+                max_len=max_len or 4096,  # VoxCPM.generate's default
+                cfg_value=options.cfg_value,
+                inference_timesteps=options.inference_timesteps,
+                retry_badcase=True,
+                seed=seed,
+            ))
+            wav = wav.squeeze(0).cpu().numpy()
+        else:
+            wav = self.model.generate(
+                text=text,
+                reference_wav_path=reference,
+                **extra,
+                cfg_value=options.cfg_value,
+                inference_timesteps=options.inference_timesteps,
+                normalize=options.normalize,
+                denoise=False,  # references are denoised once up front (see _prepared_reference)
+                seed=seed,
+            )
         wav = np.asarray(wav, dtype=np.float32)
         if options.clean_generated:
             wav = clean_voice(wav, self.sample_rate, target_lufs=options.target_lufs)
@@ -1721,7 +1757,10 @@ class VideoDubber:
             return pitch_limits is None or pitch is None or pitch_limits[0] <= pitch <= pitch_limits[1]
 
         best = None
-        for attempt in range(max(1, attempts or options.max_attempts)):
+        tries = max(1, attempts or options.max_attempts)
+        for attempt in range(tries):
+            if self.on_try:
+                self.on_try(attempt + 1, tries)
             faster = best is not None and slot > 0 and best["duration"] > slot * 1.15
             text = self._line_text(line, profile, mode, options, faster=faster, short=short)
             seed = (speaker_seed(line.speaker, options.seed) + attempt * 7919) & 0x7FFFFFFF

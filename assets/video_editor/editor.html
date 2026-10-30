@@ -9,8 +9,6 @@
         <div class="vxe-subbox-h" data-corner="nw"></div><div class="vxe-subbox-h" data-corner="ne"></div>
         <div class="vxe-subbox-h" data-corner="sw"></div><div class="vxe-subbox-h" data-corner="se"></div>
       </div>
-      <div class="vxe-caption" data-role="caption"></div>
-      <canvas class="vxe-subcanvas" data-role="subcanvas"></canvas>
       <div class="vxe-drop" data-role="drop">
         <div class="vxe-drop-title">🎬 Drop your video (or audio, e.g. .wav) here</div>
         <div class="vxe-drop-sub">or</div>
@@ -79,8 +77,7 @@
     <div class="vxe-group vxe-right">
       <button class="vxe-btn vxe-primary" data-act="export">⬇ Export video</button>
       <button class="vxe-btn" data-act="change-video" title="Use another video">🎞 Change video</button>
-      <button class="vxe-btn" data-act="reload" title="Reload the project from the SRT → Speech tab">⟳</button>
-      <button class="vxe-btn" data-act="captions" data-role="captions" title="Show the new subtitles on the video (preview and export); edit them on the 💬 Subtitles track">💬 Subtitles</button>
+      <button class="vxe-btn" data-act="reload" title="Reload the project (lines, voices and edits from the steps before)">⟳</button>
       <button class="vxe-btn" data-act="fullscreen" title="Full screen (F) — Esc to leave">⛶ Full screen</button>
     </div>
   </div>
@@ -92,8 +89,8 @@
     Click a clip to select it (Shift+click for more) · drag left/right to move it in time, up/down to another row · drag its edges to trim ·
     double-click to play it · ←/→ nudge 0.05 s (Shift: 0.5 s) · Alt+↑/↓ row up/down · C cut at the playhead · Alt+click cut there ·
     J join pieces back · [ / ] slower / faster · Delete removes a piece · M mute · S align to detected speech · R regenerate · Space play/pause ·
-    Ctrl/⌘+wheel zoom · Alt while dragging = no snapping · F full screen (Esc to leave) · O original sound on / off · N new subtitle at the playhead; double-click the 💬 Subtitles track to add one there, drag a subtitle or its edges to change its time (up/down for another row — a higher row is drawn above), Delete removes it.
-    The <b>🌫 Blur</b> track says when the original subtitles are hidden — switching Original subtitles from Kept to Blurred or Removed places one blur over each original subtitle found in the picture, as wide as its line (💬 places them over the new subtitles instead): drag a blur or its edges to change its time, double-click the track (or +) to add one, select one to change its area (✏️) or how it hides them, C splits it at the playhead, Delete removes it.
+    Ctrl/⌘+wheel zoom · Alt while dragging = no snapping · F full screen (Esc to leave) · O original sound on / off.
+    The <b>🌫 Blur</b> track says when the original subtitles are hidden — switching Original subtitles from Kept to Blurred or Removed places one blur over each original subtitle found in the picture, as wide as its line (💬 places them on the lines' times instead): drag a blur or its edges to change its time, double-click the track (or +) to add one, select one to change its area (✏️) or how it hides them, C splits it at the playhead, Delete removes it.
     Grey blocks on the <b>🎞 Original sound</b> track are where someone speaks in the video (red: no new voice over them); click the track to select a part of the original sound, C cuts it at the playhead, then give each part its own volume and sound (e.g. keep a real scream).
   </div>
 </div>
