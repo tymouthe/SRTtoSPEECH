@@ -974,200 +974,202 @@ def build_srt_tab(demo: VoxCPMDemo, blocks: gr.Blocks, steps: gr.Tabs) -> dict:
     poll_timer = gr.Timer(1.0, active=False)
     poll_shown = gr.State(-1)  # lines listed by the page while it follows a run in the background
 
-    # ----- ① Script: the SRT (and optionally the video), analyzed into speakers and lines -----
-    with gr.Tab(I18N("step_script"), id="script") as script_step:
-        gr.HTML(_step_intro("Load your script", "Upload a tagged SRT — <code>[Name|male|adult|sad] text</code> — and, "
-                            "if you have it, the original video. Analyze, then check the lines below."))
-        with gr.Row(equal_height=False):
-            with gr.Column(scale=3, elem_classes=["studio-card"]):
-                srt_input = gr.File(label="📝 Tagged subtitles (.srt)", file_types=[".srt"], type="filepath")
-                video_input = gr.File(
-                    label="🎬 Original video (optional) — each line's emotion and tone are read from its speech",
-                    file_types=["video", "audio", ".mkv", ".avi", ".mov", ".mp4", ".webm", ".wav", ".mp3", ".m4a"],
-                    type="filepath",
-                )
-            with gr.Column(scale=2, elem_classes=["studio-card"]):
-                video_emotion_input = gr.Checkbox(
-                    value=False,
-                    label="Also take each line's emotion from the video (rough)",
-                    info="Off: only the tone (louder, softer, faster, …) is read. On: lines with no emotion in their tag also get "
-                    "one from the video — a rough guess (any tense, raised voice is heard as angry)",
-                    elem_classes=["switch-toggle"],
-                )
-                auto_voices_input = gr.Checkbox(
-                    value=True,
-                    label="🪄 Give each speaker the voice template that fits them best",
-                    info="From their gender, age and description (and their voice in the original video, if added); "
-                    "off: a new voice is designed from each speaker's first line",
-                    elem_classes=["switch-toggle"],
-                )
-                isolate_input = gr.Checkbox(
-                    value=False,
-                    label="Separate the voices from the music first",
-                    info="Slower (a few minutes, and a one-time download), much more accurate when there is music under the speech",
-                    elem_classes=["switch-toggle"],
-                )
-                guess_emotion = gr.Checkbox(
-                    value=True,
-                    label="Guess missing emotions",
-                    info="From punctuation (?!, !, …) and English keywords; marked (guessed) so you can check them",
-                    elem_classes=["switch-toggle"],
-                )
-        with gr.Row():
-            analyze_btn = gr.Button("🔍 Analyze script", variant="primary", size="lg", scale=3)
-            script_next = gr.Button("Next: Voices →", variant="secondary", size="lg", scale=1)
-        script_notes = gr.Markdown()
-        lines_table = gr.Dataframe(
-            headers=_SRT_LINE_HEADERS,
-            datatype=["number", "number", "number", "str", "str", "str", "str"],
-            label="💬 Lines — edit speaker, emotion (happy, sad, angry, fearful, surprised, … or any word) or tone "
-            "(how it is said, e.g. louder and more forceful, speaking faster)",
-            interactive=True,
-            wrap=True,
-            max_height=420,
-        )
-        with gr.Row(equal_height=False):
-            tagged_output = gr.File(label="Tagged SRT (every line with speaker, gender, age and emotion)", scale=2)
-            with gr.Accordion("📖 How it works", open=False, elem_classes=["studio-help"]):
-                gr.Markdown(_SRT_INSTRUCTIONS)
+    # Only the steps go inside the step tabs (anything else there is taken for another tab).
+    with steps:
+        # ----- ① Script: the SRT (and optionally the video), analyzed into speakers and lines -----
+        with gr.Tab(I18N("step_script"), id="script") as script_step:
+            gr.HTML(_step_intro("Load your script", "Upload a tagged SRT — <code>[Name|male|adult|sad] text</code> — and, "
+                                "if you have it, the original video. Analyze, then check the lines below."))
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=3, elem_classes=["studio-card"]):
+                    srt_input = gr.File(label="📝 Tagged subtitles (.srt)", file_types=[".srt"], type="filepath")
+                    video_input = gr.File(
+                        label="🎬 Original video (optional) — each line's emotion and tone are read from its speech",
+                        file_types=["video", "audio", ".mkv", ".avi", ".mov", ".mp4", ".webm", ".wav", ".mp3", ".m4a"],
+                        type="filepath",
+                    )
+                with gr.Column(scale=2, elem_classes=["studio-card"]):
+                    video_emotion_input = gr.Checkbox(
+                        value=False,
+                        label="Also take each line's emotion from the video (rough)",
+                        info="Off: only the tone (louder, softer, faster, …) is read. On: lines with no emotion in their tag also get "
+                        "one from the video — a rough guess (any tense, raised voice is heard as angry)",
+                        elem_classes=["switch-toggle"],
+                    )
+                    auto_voices_input = gr.Checkbox(
+                        value=True,
+                        label="🪄 Give each speaker the voice template that fits them best",
+                        info="From their gender, age and description (and their voice in the original video, if added); "
+                        "off: a new voice is designed from each speaker's first line",
+                        elem_classes=["switch-toggle"],
+                    )
+                    isolate_input = gr.Checkbox(
+                        value=False,
+                        label="Separate the voices from the music first",
+                        info="Slower (a few minutes, and a one-time download), much more accurate when there is music under the speech",
+                        elem_classes=["switch-toggle"],
+                    )
+                    guess_emotion = gr.Checkbox(
+                        value=True,
+                        label="Guess missing emotions",
+                        info="From punctuation (?!, !, …) and English keywords; marked (guessed) so you can check them",
+                        elem_classes=["switch-toggle"],
+                    )
+            with gr.Row():
+                analyze_btn = gr.Button("🔍 Analyze script", variant="primary", size="lg", scale=3)
+                script_next = gr.Button("Next: Voices →", variant="secondary", size="lg", scale=1)
+            script_notes = gr.Markdown()
+            lines_table = gr.Dataframe(
+                headers=_SRT_LINE_HEADERS,
+                datatype=["number", "number", "number", "str", "str", "str", "str"],
+                label="💬 Lines — edit speaker, emotion (happy, sad, angry, fearful, surprised, … or any word) or tone "
+                "(how it is said, e.g. louder and more forceful, speaking faster)",
+                interactive=True,
+                wrap=True,
+                max_height=420,
+            )
+            with gr.Row(equal_height=False):
+                tagged_output = gr.File(label="Tagged SRT (every line with speaker, gender, age and emotion)", scale=2)
+                with gr.Accordion("📖 How it works", open=False, elem_classes=["studio-help"]):
+                    gr.Markdown(_SRT_INSTRUCTIONS)
 
-    # ----- ② Voices: who speaks, and which voice each of them gets -----
-    with gr.Tab(I18N("step_voices"), id="voices") as voices_step:
-        gr.HTML(_step_intro("Cast the voices", "Check each speaker's gender, age and description, and give them a voice "
-                            "template — or leave <b>auto</b> to design one from their first line."))
-        speakers_table = gr.Dataframe(
-            headers=_SRT_SPEAKER_HEADERS,
-            datatype=["str", "str", "str", "str", "number", "str"],
-            label="🎭 Speakers — gender: male / female / unknown, age: adult / kid; the description is the voice prompt; "
-            "Voice: a voice template (choose one below) or auto (designed from their first line)",
-            interactive=True,
-            wrap=True,
-        )
-        with gr.Row():
-            voice_speaker = gr.Dropdown(choices=[], label="🎙 Give a speaker a voice template — speaker", scale=2)
-            voice_template = gr.Dropdown(
-                choices=_template_choices(), value=script_voice.AUTO_VOICE, label="Voice (instead of one designed from their first line)",
-                scale=3,
-            )
-            template_preview = gr.Audio(label="Listen to this voice", type="filepath", scale=3)
-            apply_voice_btn = gr.Button("✅ Use this voice", variant="secondary", scale=1)
-            pick_voices_btn = gr.Button("🪄 Pick the best voices for all speakers", variant="secondary", scale=1)
-        with gr.Accordion("🎙 Manage voice templates (kept for all your projects)", open=False):
-            gr.Markdown(
-                "A voice template is a voice you choose once and use again — for any speaker, in any project — instead of "
-                "a new random voice designed from each speaker's first line. Every line of a speaker with a template copies "
-                "it and adds its own emotion. **Make the starter voices** once (it loads VoxCPM; about 10 s per voice), make "
-                "your own from a description, keep a voice you like from a project, or upload a clip (5–15 s of one person "
-                "speaking clearly)."
-            )
-            starters_btn = gr.Button(
-                "✨ Make the starter voices — Man, Woman, Young man, Young woman, Old man, Old woman, Boy, Girl, Kid, Narrator",
-                variant="primary",
-            )
-            library_table = gr.Dataframe(
-                headers=["Voice", "Gender", "Age", "Description", "Starter"], label="Voice templates", interactive=False, wrap=True,
+        # ----- ② Voices: who speaks, and which voice each of them gets -----
+        with gr.Tab(I18N("step_voices"), id="voices") as voices_step:
+            gr.HTML(_step_intro("Cast the voices", "Check each speaker's gender, age and description, and give them a voice "
+                                "template — or leave <b>auto</b> to design one from their first line."))
+            speakers_table = gr.Dataframe(
+                headers=_SRT_SPEAKER_HEADERS,
+                datatype=["str", "str", "str", "str", "number", "str"],
+                label="🎭 Speakers — gender: male / female / unknown, age: adult / kid; the description is the voice prompt; "
+                "Voice: a voice template (choose one below) or auto (designed from their first line)",
+                interactive=True,
+                wrap=True,
             )
             with gr.Row():
-                new_voice_name = gr.Textbox(label="New voice: name", placeholder="e.g. Grandpa", scale=2)
-                new_voice_gender = gr.Dropdown(["male", "female", "unknown"], value="male", label="Gender", scale=1)
-                new_voice_age = gr.Dropdown(list(script_voice.AGES), value="adult", label="Age", scale=1)
-                new_voice_desc = gr.Textbox(label="Description (the voice prompt)", placeholder="e.g. Old village chief, deep and slow", scale=4)
-                make_voice_btn = gr.Button("🎨 Make this voice", scale=1)
-            with gr.Row():
-                keep_speaker = gr.Dropdown(choices=[], label="Keep a speaker's voice from this project", scale=2)
-                keep_name = gr.Textbox(label="as the template", placeholder="name", scale=2)
-                keep_btn = gr.Button("⭐ Save it as a template", scale=1)
-            with gr.Row():
-                upload_clip = gr.Audio(sources=["upload"], type="filepath", label="Or upload a clip", scale=3)
-                upload_name = gr.Textbox(label="as the template", placeholder="name", scale=2)
-                upload_gender = gr.Dropdown(["male", "female", "unknown"], value="unknown", label="Gender", scale=1)
-                upload_age = gr.Dropdown(list(script_voice.AGES), value="adult", label="Age", scale=1)
-                upload_btn = gr.Button("⬆️ Save the clip", scale=1)
-            with gr.Row():
-                delete_pick = gr.Dropdown(choices=[], label="Delete a voice template", scale=3)
-                delete_btn = gr.Button("🗑 Delete", scale=1)
-            library_notes = gr.Markdown()
-        voice_notes = gr.Markdown()
-        with gr.Row(elem_classes=["studio-nav"]):
-            voices_back = gr.Button("← Script", variant="secondary", scale=0, min_width=160)
-            voices_next = gr.Button("Next: Generate →", variant="primary", scale=0, min_width=200)
+                voice_speaker = gr.Dropdown(choices=[], label="🎙 Give a speaker a voice template — speaker", scale=2)
+                voice_template = gr.Dropdown(
+                    choices=_template_choices(), value=script_voice.AUTO_VOICE, label="Voice (instead of one designed from their first line)",
+                    scale=3,
+                )
+                template_preview = gr.Audio(label="Listen to this voice", type="filepath", scale=3)
+                apply_voice_btn = gr.Button("✅ Use this voice", variant="secondary", scale=1)
+                pick_voices_btn = gr.Button("🪄 Pick the best voices for all speakers", variant="secondary", scale=1)
+            with gr.Accordion("🎙 Manage voice templates (kept for all your projects)", open=False):
+                gr.Markdown(
+                    "A voice template is a voice you choose once and use again — for any speaker, in any project — instead of "
+                    "a new random voice designed from each speaker's first line. Every line of a speaker with a template copies "
+                    "it and adds its own emotion. **Make the starter voices** once (it loads VoxCPM; about 10 s per voice), make "
+                    "your own from a description, keep a voice you like from a project, or upload a clip (5–15 s of one person "
+                    "speaking clearly)."
+                )
+                starters_btn = gr.Button(
+                    "✨ Make the starter voices — Man, Woman, Young man, Young woman, Old man, Old woman, Boy, Girl, Kid, Narrator",
+                    variant="primary",
+                )
+                library_table = gr.Dataframe(
+                    headers=["Voice", "Gender", "Age", "Description", "Starter"], label="Voice templates", interactive=False, wrap=True,
+                )
+                with gr.Row():
+                    new_voice_name = gr.Textbox(label="New voice: name", placeholder="e.g. Grandpa", scale=2)
+                    new_voice_gender = gr.Dropdown(["male", "female", "unknown"], value="male", label="Gender", scale=1)
+                    new_voice_age = gr.Dropdown(list(script_voice.AGES), value="adult", label="Age", scale=1)
+                    new_voice_desc = gr.Textbox(label="Description (the voice prompt)", placeholder="e.g. Old village chief, deep and slow", scale=4)
+                    make_voice_btn = gr.Button("🎨 Make this voice", scale=1)
+                with gr.Row():
+                    keep_speaker = gr.Dropdown(choices=[], label="Keep a speaker's voice from this project", scale=2)
+                    keep_name = gr.Textbox(label="as the template", placeholder="name", scale=2)
+                    keep_btn = gr.Button("⭐ Save it as a template", scale=1)
+                with gr.Row():
+                    upload_clip = gr.Audio(sources=["upload"], type="filepath", label="Or upload a clip", scale=3)
+                    upload_name = gr.Textbox(label="as the template", placeholder="name", scale=2)
+                    upload_gender = gr.Dropdown(["male", "female", "unknown"], value="unknown", label="Gender", scale=1)
+                    upload_age = gr.Dropdown(list(script_voice.AGES), value="adult", label="Age", scale=1)
+                    upload_btn = gr.Button("⬆️ Save the clip", scale=1)
+                with gr.Row():
+                    delete_pick = gr.Dropdown(choices=[], label="Delete a voice template", scale=3)
+                    delete_btn = gr.Button("🗑 Delete", scale=1)
+                library_notes = gr.Markdown()
+            voice_notes = gr.Markdown()
+            with gr.Row(elem_classes=["studio-nav"]):
+                voices_back = gr.Button("← Script", variant="secondary", scale=0, min_width=160)
+                voices_next = gr.Button("Next: Generate →", variant="primary", scale=0, min_width=200)
 
-    # ----- ③ Generate: voice every line, listen, fix the ones that need it -----
-    with gr.Tab(I18N("step_generate"), id="generate") as generate_step:
-        gr.HTML(_step_intro("Generate the lines", "Every line is voiced and checked; lines that fail are retried "
-                            "automatically. Listen, fix any line, then place them on your video."))
-        with gr.Accordion("⚙️ Settings", open=False):
+        # ----- ③ Generate: voice every line, listen, fix the ones that need it -----
+        with gr.Tab(I18N("step_generate"), id="generate") as generate_step:
+            gr.HTML(_step_intro("Generate the lines", "Every line is voiced and checked; lines that fail are retried "
+                                "automatically. Listen, fix any line, then place them on your video."))
+            with gr.Accordion("⚙️ Settings", open=False):
+                with gr.Row():
+                    verify_voice = gr.Checkbox(
+                        value=True,
+                        label="Check every line matches its speaker's first line",
+                        info="CAM++ voice check; regenerates until consistent",
+                    )
+                    max_tries = gr.Slider(1, 20, value=8, step=1, label="Max tries per line", info="Each first line gets at least 12")
+                    max_speedup = gr.Slider(
+                        1.0, 1.5, value=1.1, step=0.05, label="Max speed-up to fit a line (combined track)",
+                        info="Longer lines push the next lines later instead of being squeezed (squeezing changes the voice)",
+                    )
+                    pad_to_slot = gr.Checkbox(
+                        value=False,
+                        label="Pad short lines with silence",
+                        info="Off: every line file keeps its natural length. On: silence after the speech up to the slot length",
+                    )
+                with gr.Row():
+                    remove_silence = gr.Checkbox(
+                        value=True,
+                        label="Remove silences",
+                        info="Cut the silence before and after each line and shorten long pauses inside it",
+                    )
+                    max_pause = gr.Slider(
+                        0.05, 0.6, value=0.2, step=0.05, label="Longest pause kept inside a line (s)",
+                        info="Pauses longer than this are shortened to it",
+                    )
+                with gr.Row():
+                    cfg_value = gr.Slider(1.0, 3.0, value=2.0, step=0.1, label=I18N("cfg_label"))
+                    dit_steps = gr.Slider(1, 50, value=10, step=1, label=I18N("dit_steps_label"))
             with gr.Row():
-                verify_voice = gr.Checkbox(
-                    value=True,
-                    label="Check every line matches its speaker's first line",
-                    info="CAM++ voice check; regenerates until consistent",
-                )
-                max_tries = gr.Slider(1, 20, value=8, step=1, label="Max tries per line", info="Each first line gets at least 12")
-                max_speedup = gr.Slider(
-                    1.0, 1.5, value=1.1, step=0.05, label="Max speed-up to fit a line (combined track)",
-                    info="Longer lines push the next lines later instead of being squeezed (squeezing changes the voice)",
-                )
-                pad_to_slot = gr.Checkbox(
-                    value=False,
-                    label="Pad short lines with silence",
-                    info="Off: every line file keeps its natural length. On: silence after the speech up to the slot length",
-                )
-            with gr.Row():
-                remove_silence = gr.Checkbox(
-                    value=True,
-                    label="Remove silences",
-                    info="Cut the silence before and after each line and shorten long pauses inside it",
-                )
-                max_pause = gr.Slider(
-                    0.05, 0.6, value=0.2, step=0.05, label="Longest pause kept inside a line (s)",
-                    info="Pauses longer than this are shortened to it",
-                )
-            with gr.Row():
-                cfg_value = gr.Slider(1.0, 3.0, value=2.0, step=0.1, label=I18N("cfg_label"))
-                dit_steps = gr.Slider(1, 50, value=10, step=1, label=I18N("dit_steps_label"))
-        with gr.Row():
-            generate_btn = gr.Button("▶ Generate all lines", variant="primary", size="lg", scale=2)
-            speaker_gen_picker = gr.Dropdown(
-                choices=[], label="…or one speaker at a time (make their lines, listen, then the next)",
-                scale=4,
-            )
-            speaker_gen_btn = gr.Button("▶ Generate only this speaker's lines", variant="secondary", scale=1)
-        notes_box = gr.Markdown()
-        with gr.Row(equal_height=False):
-            with gr.Column(elem_classes=["studio-card"]):
-                audio_output = gr.Audio(label="Combined track (on the SRT timing)", type="filepath")
-                line_picker = gr.Dropdown(choices=[], label="🎧 Listen to a line", interactive=True)
-                line_player = gr.Audio(label="Selected line", type="filepath")
-            with gr.Column(elem_classes=["studio-card"]):
-                zip_output = gr.DownloadButton("⬇️ Download all lines (.zip)", variant="primary", interactive=False)
-                line_files_output = gr.File(
-                    label="⬇️ Every line as its own file — click a file to download just that one", file_count="multiple"
-                )
-        with gr.Accordion("🛠 Fix lines and voices", open=True):
-            with gr.Row():
-                retry_picker = gr.Dropdown(
-                    choices=[],
-                    multiselect=True,
-                    label="🔁 Lines to regenerate — failed lines (⚠) are selected after Generate; edit a line's text or "
-                    "emotion on the Script step first if you like",
+                generate_btn = gr.Button("▶ Generate all lines", variant="primary", size="lg", scale=2)
+                speaker_gen_picker = gr.Dropdown(
+                    choices=[], label="…or one speaker at a time (make their lines, listen, then the next)",
                     scale=4,
                 )
-                retry_btn = gr.Button("🔁 Regenerate selected lines", variant="secondary", scale=1)
-            with gr.Row():
-                revoice_picker = gr.Dropdown(
-                    choices=[],
-                    label="🎭 New voice for a speaker — their voice is designed again (from their gender, age and description "
-                    "on the Voices step) and all of their lines are regenerated",
-                    scale=2,
-                )
-                voice_preview = gr.Audio(label="This speaker's voice (what all their lines copy)", type="filepath", scale=2)
-                revoice_btn = gr.Button("🎭 New voice — redo all their lines", variant="secondary", scale=1)
-        with gr.Accordion("📊 Report", open=False):
-            report_table = gr.Dataframe(headers=_SRT_REPORT_HEADERS, show_label=False, interactive=False, wrap=True)
-        with gr.Row(elem_classes=["studio-nav"]):
-            generate_back = gr.Button("← Voices", variant="secondary", scale=0, min_width=160)
-            editor_btn = gr.Button("Next: place on the video →", variant="primary", visible=False, scale=0, min_width=240)
+                speaker_gen_btn = gr.Button("▶ Generate only this speaker's lines", variant="secondary", scale=1)
+            notes_box = gr.Markdown()
+            with gr.Row(equal_height=False):
+                with gr.Column(elem_classes=["studio-card"]):
+                    audio_output = gr.Audio(label="Combined track (on the SRT timing)", type="filepath")
+                    line_picker = gr.Dropdown(choices=[], label="🎧 Listen to a line", interactive=True)
+                    line_player = gr.Audio(label="Selected line", type="filepath")
+                with gr.Column(elem_classes=["studio-card"]):
+                    zip_output = gr.DownloadButton("⬇️ Download all lines (.zip)", variant="primary", interactive=False)
+                    line_files_output = gr.File(
+                        label="⬇️ Every line as its own file — click a file to download just that one", file_count="multiple"
+                    )
+            with gr.Accordion("🛠 Fix lines and voices", open=True):
+                with gr.Row():
+                    retry_picker = gr.Dropdown(
+                        choices=[],
+                        multiselect=True,
+                        label="🔁 Lines to regenerate — failed lines (⚠) are selected after Generate; edit a line's text or "
+                        "emotion on the Script step first if you like",
+                        scale=4,
+                    )
+                    retry_btn = gr.Button("🔁 Regenerate selected lines", variant="secondary", scale=1)
+                with gr.Row():
+                    revoice_picker = gr.Dropdown(
+                        choices=[],
+                        label="🎭 New voice for a speaker — their voice is designed again (from their gender, age and description "
+                        "on the Voices step) and all of their lines are regenerated",
+                        scale=2,
+                    )
+                    voice_preview = gr.Audio(label="This speaker's voice (what all their lines copy)", type="filepath", scale=2)
+                    revoice_btn = gr.Button("🎭 New voice — redo all their lines", variant="secondary", scale=1)
+            with gr.Accordion("📊 Report", open=False):
+                report_table = gr.Dataframe(headers=_SRT_REPORT_HEADERS, show_label=False, interactive=False, wrap=True)
+            with gr.Row(elem_classes=["studio-nav"]):
+                generate_back = gr.Button("← Voices", variant="secondary", scale=0, min_width=160)
+                editor_btn = gr.Button("Next: place on the video →", variant="primary", visible=False, scale=0, min_width=240)
 
     # ----- voice templates -----
     def _library_view():
@@ -1827,7 +1829,9 @@ def create_demo_interface(demo: VoxCPMDemo):
         )
         # Script → Voices → Generate → Video, shown as numbered steps (each one can be opened at any time).
         with gr.Tabs(elem_id="studio-steps") as steps:
-            srt = build_srt_tab(demo, interface, steps)
+            pass
+        srt = build_srt_tab(demo, interface, steps)  # adds steps 1-3 (its states stay outside the tabs)
+        with steps:
             with gr.Tab(I18N("step_video"), id="editor") as editor_step:
                 build_editor_tab(steps, editor_step, srt)
         # Back on a step of the script after editing in the video editor: show the edited / regenerated lines.
