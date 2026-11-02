@@ -520,32 +520,179 @@ function stackOverlaps(names) {
   });
   return rows;
 }
-function alignClips(lineIds, quiet) {
+function speechParts() {
+  // Each stretch of speech belongs to the line whose subtitle time covers most of it: line index -> region indices.
+  const own = {};
+  regions().forEach((r, k) => {
+    let best = null, most = 0;
+    S.lines.forEach((l) => {
+      const o = Math.min(r[1], l.end) - Math.max(r[0], l.start);
+      if (l.url && o > most) { best = l.index; most = o; }
+    });
+    if (best != null) (own[best] = own[best] || []).push(k);
+  });
+  return own;
+}
+function pausesIn(buf, from, to) {
+  // Middles of the pauses (≥ 0.15 s of near-silence) between seconds `from` and `to` of a line's audio.
+  const sr = buf.sampleRate, data = buf.getChannelData(0), hop = Math.max(1, Math.round(sr * 0.01));
+  const rms = [];
+  for (let i = Math.floor(from * sr), b = Math.min(Math.floor(to * sr), data.length); i + hop <= b; i += hop) {
+    let sum = 0;
+    for (let j = i; j < i + hop; j++) sum += data[j] * data[j];
+    rms.push(Math.sqrt(sum / hop));
+  }
+  const quiet = rms.reduce((m, v) => Math.max(m, v), 1e-6) * 0.06; // about 24 dB under the loudest part
+  const out = [];
+  let run = -1;
+  rms.forEach((v, i) => {
+    if (v < quiet) { if (run < 0) run = i; return; }
+    if (run > 0 && (i - run) * 0.01 >= 0.15) out.push(from + (run + i) / 2 * 0.01); // not the silence it starts with
+    run = -1;
+  });
+  return out;
+}
+function splitPlan(idx, ks) {
+  // Where to cut a line so each part goes on one stretch of its speech: the cuts are pauses in the new voice,
+  // as near as possible to where the speech in the video pauses (by how much was said before). Stretches with
+  // a pause the new voice does not have are taken together. -> { parts: [[start, end], …], cuts: [seconds] }
+  const l = S.lineMap[idx], c = S.clips[keysOfLine(idx)[0]], buf = S.buffers[l.url];
+  const parts = ks.map((k) => regions()[k].slice());
+  const from = c.trim_in || 0, to = (l.duration || 0) - (c.trim_out || 0);
+  const cands = buf ? pausesIn(buf, from, to) : [];
+  while (parts.length - 1 > cands.length) {
+    let j = 0;
+    for (let i = 1; i < parts.length - 1; i++) if (parts[i + 1][0] - parts[i][1] < parts[j + 1][0] - parts[j][1]) j = i;
+    parts.splice(j, 2, [parts[j][0], parts[j + 1][1]]);
+  }
+  const said = parts.map((p) => p[1] - p[0]), total = said.reduce((a, b) => a + b, 0);
+  const cuts = [];
+  let next = 0, sofar = 0;
+  for (let j = 0; j < parts.length - 1; j++) {
+    sofar += said[j];
+    const want = from + (to - from) * sofar / total, last = cands.length - (parts.length - 1 - j);
+    let best = next;
+    for (let i = next; i <= last; i++) if (Math.abs(cands[i] - want) < Math.abs(cands[best] - want)) best = i;
+    cuts.push(cands[best]);
+    next = best + 1;
+  }
+  return { parts, cuts };
+}
+function unsplit(idx) {
+  // Joins back the pieces an earlier 🎯 Align cut a line into (pieces you cut yourself stay).
+  const list = keysOfLine(idx);
+  if (list.length < 2 || !list.every((k) => S.clips[k].auto_split)) return;
+  const c = S.clips[list[0]];
+  c.trim_out = S.clips[list[list.length - 1]].trim_out || 0;
+  c.speed = 1;
+  delete c.auto_split;
+  list.slice(1).forEach((k) => { delete S.clips[k]; });
+}
+function splitLine(idx, plan) {
+  // Cuts a line at plan.cuts and puts each piece at the start of its part, sped up (up to 2×) to fit in it.
+  const first = keysOfLine(idx)[0], l = S.lineMap[idx], c = S.clips[first];
+  const edges = [c.trim_in || 0, ...plan.cuts, (l.duration || 0) - (c.trim_out || 0)];
+  let faster = false;
+  plan.parts.forEach((p, j) => {
+    const key = j ? newKey(idx) : first;
+    if (j) S.clips[key] = Object.assign({}, c);
+    const piece = S.clips[key];
+    piece.line = idx;
+    piece.trim_in = r3(edges[j]);
+    piece.trim_out = r3((l.duration || 0) - edges[j + 1]);
+    piece.start = r3(p[0]);
+    piece.speed = Math.round(clamp((edges[j + 1] - edges[j]) / Math.max(p[1] - p[0], 0.1), 1, SPEED_MAX) * 100) / 100;
+    piece.auto_split = true;
+    faster = faster || piece.speed > 1;
+  });
+  return faster;
+}
+async function waitForAudio(lineIds, seconds) {
+  // The line audio is needed to find the pauses in it; it loads in the background.
+  const left = () => lineIds.map((i) => S.lineMap[i]).filter((l) => l && l.url && !S.buffers[l.url]);
+  left().forEach(loadBuffer);
+  for (let t = 0; left().length && t < seconds * 10; t++) await new Promise((r) => setTimeout(r, 100));
+}
+async function alignClips(lineIds, quiet) {
   // Same rule as video_editor.align_to_speech: a line starts where its speech starts; lines spoken without a
-  // pause share one stretch, and the later ones move by the same amount as the first.
-  if (!regions().length) { setStatus('No speech was found in the video — open ⚙ on the <b>Video speech</b> track to detect it again.'); return; }
+  // pause share one stretch, and the later ones move by the same amount as the first. A line whose speech in
+  // the video has pauses is cut at the pauses of the new voice, and each piece goes on its own stretch.
+  if (!regions().length) { setStatus('No speech was found in the video — open ⚙ on the <b>Video speech</b> track to detect it again.'); return null; }
+  if (!quiet) setStatus('🎯 Lining up the clips with the speech in the video…');
+  await waitForAudio(lineIds, 15);
   pushUndo();
+  lineIds.forEach(unsplit);
+  const own = speechParts();
   const shift = {};
+  const placed = []; // [line index, region, start] in subtitle order
+  const plans = {}; // line index -> where to cut it, or the room it has when it is not cut
   let moved = 0, missed = 0;
-  S.lines.forEach((l) => {
+  S.lines.slice().sort((a, b) => a.start - b.start).forEach((l) => {
     if (!l.url) return;
+    const mine = own[l.index] || [];
+    if (mine.length > 1 && lineIds.includes(l.index) && keysOfLine(l.index).length === 1) {
+      const plan = splitPlan(l.index, mine);
+      mine.forEach((k) => { if (!(k in shift)) shift[k] = regions()[k][0] - l.start; });
+      placed.push([l.index, mine[mine.length - 1], plan.parts[0][0]]);
+      if (plan.parts.length > 1) plans[l.index] = plan;
+      else { moveLine(l.index, plan.parts[0][0]); plans[l.index] = { room: plan.parts[0][1] - plan.parts[0][0] }; }
+      moved++;
+      return;
+    }
     const k = bestRegion(l, shift);
     if (k == null) { if (lineIds.includes(l.index)) missed++; return; }
     const r = regions()[k];
     const start = k in shift ? Math.max(l.start + shift[k], r[0]) : r[0];
     if (!(k in shift)) shift[k] = r[0] - l.start;
+    placed.push([l.index, k, start]);
     if (!lineIds.includes(l.index)) return;
     moveLine(l.index, start);
     moved++;
+  });
+  // A line longer than the speech it replaces is sped up (up to 2×) to end with it: its room runs to the end of
+  // that speech, or to the next line spoken in the same stretch.
+  const faster = [], split = [];
+  placed.forEach(([idx, k, start], n) => {
+    if (!lineIds.includes(idx)) return;
+    const plan = plans[idx];
+    if (plan && plan.parts) {
+      split.push('#' + idx + ' (' + plan.parts.length + ' parts)');
+      if (splitLine(idx, plan)) faster.push('#' + idx);
+      return;
+    }
+    const next = placed.slice(n + 1).find((p) => p[1] === k);
+    const room = plan ? plan.room : (next ? Math.min(next[2], regions()[k][1]) : regions()[k][1]) - start;
+    if (fitLine(idx, start, room)) faster.push('#' + idx + ' ' + speedLabel(speedOf(keysOfLine(idx)[0])));
   });
   const touched = [...new Set(lineIds.map((i) => S.lineMap[i] && S.lineMap[i].speaker).filter(Boolean))];
   const before = overlaps().size;
   stackOverlaps(touched);
   changed();
+  keys().forEach(loadStretched);
+  const list = (a) => a.slice(0, 12).join(', ') + (a.length > 12 ? '…' : '');
   if (!quiet) {
     setStatus('🎯 Lined up ' + moved + ' clip(s) with the speech in the video' + (missed ? '; ' + missed + ' had no speech near their subtitle time' : '') + '.' +
+      (split.length ? ' ✂ Cut where the video pauses: ' + list(split) + '.' : '') +
+      (faster.length ? ' Sped up to fit the speech: ' + list(faster) + '.' : '') +
       (before ? ' Clips that now overlap were put on separate rows — drag them up/down, or use <b>⇥ Remove overlaps</b>.' : ''));
   }
+  return { split: split.length, faster: faster.length };
+}
+function fitLine(idx, start, room) {
+  // Speeds every piece of a line up by the same amount (keeping their spacing) so it ends within `room` seconds
+  // of `start`; a line that already fits plays at its normal speed. True when it was sped up.
+  const list = keysOfLine(idx).filter((k) => lineOf(k).url);
+  if (!list.length || room <= MIN_PIECE) return false;
+  const natural = (k) => sourceLen(k); // seconds at 1×
+  const offset = (k) => (S.clips[k].start - start) * speedOf(k); // the gap before a piece, at 1×
+  const span = Math.max(...list.map((k) => offset(k) + natural(k)));
+  const speed = Math.round(clamp(span / room, 1, SPEED_MAX) * 100) / 100;
+  list.forEach((k) => {
+    const off = offset(k);
+    S.clips[k].speed = speed;
+    S.clips[k].start = r3(start + off / speed);
+  });
+  return speed > 1;
 }
 function toSrt(lineIds) {
   pushUndo();
@@ -1384,8 +1531,16 @@ async function useVideoFile(file) {
     busy('Reading the video and finding the speech in it…' + (isolate ? ' Separating voices from music can take a few minutes.' : ''));
     pause();
     applyPayload(await call('editor_video', { path: up.path, isolate: isolate }));
-    setStatus('🎬 ' + esc(file.name) + ' loaded · ' + regions().length + ' stretch(es) of speech found. Clips sit on their subtitle times; ' +
-      'use <b>🎯 Align all to video speech</b> to move them onto the speech in the video.');
+    if (regions().length && S.lines.some((l) => l.url)) {
+      busy('Placing every line on the speech in the video…');
+      const done = await alignClips(S.lines.map((l) => l.index), true);
+      setStatus('🎬 ' + esc(file.name) + ' loaded · ' + regions().length + ' stretch(es) of speech found. Every clip was placed on the speech ' +
+        'it replaces' + (done && done.split ? '; ' + done.split + ' line(s) were cut where the speaker in the video pauses' : '') +
+        (done && done.faster ? '; ' + done.faster + ' line(s) longer than their speech were sped up to fit (up to 2×)' : '') +
+        '. <b>↶ Undo</b> puts them back on their subtitle times.');
+    } else {
+      setStatus('🎬 ' + esc(file.name) + ' loaded · ' + regions().length + ' stretch(es) of speech found. Clips sit on their subtitle times.');
+    }
   } catch (e) { showError(e); } finally { busy(''); root.focus({ preventScroll: true }); }
 }
 async function detectAgain() {
